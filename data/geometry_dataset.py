@@ -42,6 +42,13 @@ class StructuredSoSDataset(Dataset):
         self.seed = int(seed)
         if self.event_dropout_p < 0 or self.event_dropout_p >= 1:
             raise ValueError('event_dropout_p must be in [0,1)')
+        if self.event_dropout_p > 0:
+            first = self.cache_dir/self.records[0].get('cache_file', self.records[0]['id'] + '.npz')
+            with np.load(first, allow_pickle=False) as archive:
+                if 'subap_events' not in archive.files:
+                    raise ValueError(
+                        'Train-time event dropout requires cache v2 with subap_events; '
+                        'legacy compounded subap tensors would leak dropped transmit events')
 
     def __len__(self):
         return len(self.records)
@@ -82,6 +89,8 @@ class StructuredSoSDataset(Dataset):
         item = self._load(record)
         speed_events = np.asarray(item['speed_events'], np.complex64)
         subap = np.asarray(item['subap'], np.complex64)
+        subap_events = (np.asarray(item['subap_events'], np.complex64)
+                        if 'subap_events' in item else None)
         event_geom = np.asarray(item['event_geom'], np.float32)
         subap_geom = np.asarray(item['subap_geom'], np.float32)
         global_geom = np.asarray(item['global_geom'], np.float32)
@@ -97,6 +106,8 @@ class StructuredSoSDataset(Dataset):
             speed_events = speed_events[:, perm, ::-1, :]
             event_mask = event_mask[perm]
             subap = subap[::-1, ::-1, :]
+            if subap_events is not None:
+                subap_events = subap_events[perm, ::-1, ::-1, :]
             subap_mask = subap_mask[::-1]
             c_gt = c_gt[::-1, :]
             u_gt = u_gt[:, ::-1, :]
@@ -104,6 +115,8 @@ class StructuredSoSDataset(Dataset):
         condition = {
             'speed_events': torch.from_numpy(np.ascontiguousarray(speed_events)),
             'subap': torch.from_numpy(np.ascontiguousarray(subap)),
+            **({'subap_events': torch.from_numpy(np.ascontiguousarray(subap_events))}
+               if subap_events is not None else {}),
             'event_geom': torch.from_numpy(np.ascontiguousarray(event_geom)),
             'subap_geom': torch.from_numpy(np.ascontiguousarray(subap_geom)),
             'global_geom': torch.from_numpy(np.ascontiguousarray(global_geom)),
@@ -127,11 +140,19 @@ def geometry_collate(items):
     a_max = max(i['condition']['speed_events'].shape[1] for i in items)
     event_dim = items[0]['condition']['event_geom'].shape[-1]
     speed_events = torch.zeros(b, s, a_max, h, w, dtype=torch.complex64)
+    have_subap_events = all('subap_events' in i['condition'] for i in items)
+    if any(('subap_events' in i['condition']) != have_subap_events for i in items):
+        raise ValueError('Mixed legacy/event-resolved subap cache records in one batch')
+    k_subap = items[0]['condition']['subap'].shape[0]
+    subap_events = (torch.zeros(b, a_max, k_subap, h, w, dtype=torch.complex64)
+                    if have_subap_events else None)
     event_geom = torch.zeros(b, a_max, event_dim)
     event_mask = torch.zeros(b, a_max, dtype=torch.bool)
     for bi, item in enumerate(items):
         a = item['condition']['speed_events'].shape[1]
         speed_events[bi, :, :a] = item['condition']['speed_events']
+        if subap_events is not None:
+            subap_events[bi, :a] = item['condition']['subap_events']
         event_geom[bi, :a] = item['condition']['event_geom']
         event_mask[bi, :a] = item['condition']['event_mask']
     condition = {
@@ -139,6 +160,7 @@ def geometry_collate(items):
         'event_geom': event_geom,
         'event_mask': event_mask,
         'subap': torch.stack([i['condition']['subap'] for i in items]),
+        **({'subap_events': subap_events} if subap_events is not None else {}),
         'subap_geom': torch.stack([i['condition']['subap_geom'] for i in items]),
         'subap_mask': torch.stack([i['condition']['subap_mask'] for i in items]),
         'global_geom': torch.stack([i['condition']['global_geom'] for i in items]),

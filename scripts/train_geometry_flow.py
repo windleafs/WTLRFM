@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from data.geometry_dataset import StructuredSoSDataset, geometry_collate
-from engine import EMA, Logger, load_config, map_metrics, save_ckpt, set_seed
+from engine import EMA, Logger, load_config, save_ckpt, set_seed
 from models.geometry_flow import GeometryAwareSoSFlow
 
 
@@ -111,8 +111,34 @@ def load_pretrained(model, path, canonical_angle_deg, n_event_slots):
             'adapted_layers': changed}
 
 
+def grid_metrics(c_pred, c_gt, grid):
+    """Metrics on the structured cache's physical grid, not legacy geometry."""
+    c_pred = np.asarray(c_pred, np.float64)
+    c_gt = np.asarray(c_gt, np.float64)
+    nx, nz = c_pred.shape[-2:]
+    if (nx, nz) != (int(grid['nx']), int(grid['nz'])):
+        raise ValueError('Prediction shape does not match structured-cache grid')
+    x = np.linspace(float(grid['x0_m']), float(grid['x1_m']), nx)
+    z = np.linspace(float(grid['z0_m']), float(grid['z1_m']), nz)
+    roi = ((x[:, None] >= x.min()) & (x[:, None] <= x.max())
+           & (z[None, :] >= 3e-3) & (z[None, :] <= 45e-3))
+    if not roi.any():
+        raise ValueError('Structured-cache grid has no pixels in the 3-45 mm ROI')
+    err = c_pred - c_gt
+    mae = float(np.abs(err).mean())
+    roi_mae = float(np.abs(err[..., roi]).mean())
+    roi_mean_err = float(np.abs(err[..., roi].mean(axis=-1)).mean())
+    a, b = c_pred[..., roi], c_gt[..., roi]
+    a = a - a.mean(axis=-1, keepdims=True)
+    b = b - b.mean(axis=-1, keepdims=True)
+    denom = np.sqrt((a*a).sum(-1)*(b*b).sum(-1)) + 1e-12
+    corr = float(((a*b).sum(-1)/denom).mean())
+    return {'mae': mae, 'roi_mae': roi_mae,
+            'roi_mean_err': roi_mean_err, 'corr': corr}
+
+
 @torch.no_grad()
-def evaluate(model, loader, device, n_steps, n_samples):
+def evaluate(model, loader, device, n_steps, n_samples, grid):
     model.eval()
     preds, gts = [], []
     for batch in loader:
@@ -120,7 +146,7 @@ def evaluate(model, loader, device, n_steps, n_samples):
         c = model.sample(b['condition'], n_steps=n_steps, n_samples=n_samples)
         preds.append(c.mean(0)[:, 0].cpu().numpy())
         gts.append(b['c_gt'][:, 0].cpu().numpy())
-    return map_metrics(np.concatenate(preds), np.concatenate(gts))
+    return grid_metrics(np.concatenate(preds), np.concatenate(gts), grid)
 
 
 def main():
@@ -137,7 +163,8 @@ def main():
         args.cache, 'train', event_dropout_p=args.event_dropout,
         min_events=args.min_events, lateral_mirror=args.lateral_mirror,
         seed=args.seed, limit=args.limit)
-    val_set = StructuredSoSDataset(args.cache, 'val', limit=max(1, args.limit//4))
+    val_limit = max(1, args.limit//4) if args.limit else 0
+    val_set = StructuredSoSDataset(args.cache, 'val', limit=val_limit)
     batch_size = int(args.batch_size or cfg['data'].get('batch_size', 4))
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=batch_size, shuffle=True, num_workers=args.workers,
@@ -203,7 +230,8 @@ def main():
     if args.eval_only:
         with torch.random.fork_rng(devices=[device] if device.type == 'cuda' else []):
             torch.manual_seed(args.seed + 17)
-            metrics = evaluate(model, val_loader, device, args.ode_steps, args.n_samples)
+            metrics = evaluate(model, val_loader, device, args.ode_steps, args.n_samples,
+                               train_set.manifest['grid'])
         result = {'mode': 'eval_only', 'target_labelled_examples': 0,
                   'val': metrics, 'pretrained': pretrained_info}
         (args.out/'eval.json').write_text(json.dumps(result, indent=2) + '\n')
@@ -241,7 +269,8 @@ def main():
             with torch.random.fork_rng(devices=[device] if device.type == 'cuda' else []):
                 torch.manual_seed(args.seed + 17)
                 metrics = evaluate(ema.module, val_loader, device,
-                                   args.ode_steps, args.n_samples)
+                                   args.ode_steps, args.n_samples,
+                                   train_set.manifest['grid'])
             row['val'] = metrics
             if metrics['roi_mae'] < best:
                 best = metrics['roi_mae']

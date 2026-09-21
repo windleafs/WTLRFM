@@ -12,8 +12,8 @@ import torch
 import torch.nn.functional as F
 
 
-def analytic_baseband(rf, fs, fc):
-    """Zero-padded Hilbert transform followed by record-relative demodulation."""
+def analytic_baseband(rf, fs, fc, t0_s=0.):
+    """Zero-padded Hilbert transform followed by absolute-clock demodulation."""
     n = rf.shape[-1]
     padded = F.pad(rf, (n, n))
     m = padded.shape[-1]
@@ -23,7 +23,7 @@ def analytic_baseband(rf, fs, fc):
     if m % 2 == 0:
         h[m//2] = 1
     a = torch.fft.ifft(torch.fft.fft(padded)*h)[..., n:2*n]
-    t = torch.arange(n, device=rf.device, dtype=rf.dtype)/float(fs)
+    t = float(t0_s) + torch.arange(n, device=rf.device, dtype=rf.dtype)/float(fs)
     return a*torch.exp(-2j*torch.pi*float(fc)*t)
 
 
@@ -147,13 +147,14 @@ def das_speed_events(rf, xe, angles_deg, tx_t_ref_s, xi, zi, fs, fc,
     if not event_mask_t.any() or not element_mask_t.any():
         raise ValueError('At least one event and one receiver must remain active')
 
-    iq = analytic_baseband(rf, float(fs), float(fc))
+    iq = analytic_baseband(rf, float(fs), float(fc), float(t0_s))
     xx, zz = torch.meshgrid(xi_t, zi_t, indexing='ij')
     xx, zz = xx.reshape(-1), zz.reshape(-1)
     npix = xx.numel()
     speed_events = torch.zeros(len(speeds), n_event, npix,
                                dtype=torch.complex64, device=device)
-    subap = torch.zeros(int(n_subap), npix, dtype=torch.complex64, device=device)
+    subap_events = torch.zeros(n_event, int(n_subap), npix,
+                                dtype=torch.complex64, device=device)
     edges = subap_edges(n_elem, n_subap)
 
     for si, speed in enumerate(speeds):
@@ -179,14 +180,17 @@ def das_speed_events(rf, xe, angles_deg, tx_t_ref_s, xi, zi, fs, fc,
                 speed_events[si, ia, sl] = v.sum(0)
                 if si == ref_index:
                     for k, (s, e) in enumerate(edges):
-                        subap[k, sl] += v[s:e].sum(0)
+                        subap_events[ia, k, sl] = v[s:e].sum(0)
 
     nx, nz = len(xi_t), len(zi_t)
     subap_mask = torch.tensor([bool(element_mask_t[s:e].any()) for s, e in edges],
                               dtype=torch.bool, device=device)
+    subap_events = subap_events.reshape(n_event, int(n_subap), nx, nz)
+    subap = subap_events.sum(dim=0)
     return {
         'speed_events': speed_events.reshape(len(speeds), n_event, nx, nz),
-        'subap': subap.reshape(int(n_subap), nx, nz),
+        'subap': subap,
+        'subap_events': subap_events,
         'event_mask': event_mask_t,
         'subap_mask': subap_mask,
         'element_mask': element_mask_t,

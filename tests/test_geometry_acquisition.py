@@ -53,6 +53,8 @@ class GeometryAcquisitionTests(unittest.TestCase):
                                n_subap=2, event_mask=mask, chunk=5)
         self.assertEqual(tuple(out['speed_events'].shape), (2, 4, 3, 2))
         self.assertEqual(tuple(out['subap'].shape), (2, 3, 2))
+        self.assertEqual(tuple(out['subap_events'].shape), (4, 2, 3, 2))
+        self.assertTrue(torch.allclose(out['subap'], out['subap_events'].sum(0)))
         self.assertTrue(torch.isfinite(out['speed_events'].real).all())
         self.assertTrue((out['speed_events'][:, 1] == 0).all())
         self.assertFalse(bool(out['event_mask'][1]))
@@ -85,6 +87,34 @@ class GeometryAcquisitionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             encoder({**cond, 'event_mask': torch.zeros(1, 7, dtype=torch.bool)})
 
+    def test_encoder_is_batch_invariant_and_masked_events_do_not_leak(self):
+        torch = self.torch
+        from models.acquisition_encoder import AcquisitionConditionEncoder
+        encoder = AcquisitionConditionEncoder(n_event_slots=5, canonical_angle_deg=8.,
+                                              hidden_channels=8).eval()
+        a = self.structured()
+        b = self.structured()
+        b['speed_events'] = b['speed_events'] * 25
+        b['subap'] = b['subap'] * 25
+        pair = {k: torch.cat([a[k], b[k]], dim=0) for k in a}
+        single = encoder(a)
+        batched = encoder(pair)[:1]
+        self.assertTrue(torch.allclose(single, batched, atol=1e-6, rtol=1e-5))
+
+        c = self.structured()
+        n_event = c['speed_events'].shape[2]
+        subap_events = torch.randn(1, n_event, 4, 8, 10, dtype=torch.complex64)
+        c['subap_events'] = subap_events
+        c['subap'] = subap_events.sum(dim=1)
+        c['event_mask'][:, -1] = False
+        baseline = encoder(c)
+        changed = dict(c)
+        changed['subap_events'] = c['subap_events'].clone()
+        changed['subap_events'][:, -1] *= 1000
+        changed['subap'] = changed['subap_events'].sum(dim=1)
+        masked = encoder(changed)
+        self.assertTrue(torch.allclose(baseline, masked, atol=1e-6, rtol=1e-5))
+
     def test_rf_augmentation_masks_and_bounded_timing(self):
         torch = self.torch
         from data.rf_augment import _time_shift, augment_rf, validate_augmentation
@@ -111,6 +141,25 @@ class GeometryAcquisitionTests(unittest.TestCase):
         self.assertTrue((out[~torch.tensor(meta['event_mask'])] == 0).all())
         with self.assertRaises(ValueError):
             validate_augmentation({'event_dropout_p': 1.})
+
+    def test_physical_target_resampling(self):
+        torch = self.torch
+        from scripts.prepare_geometry_cache import physical_resample_target
+        xs = np.linspace(-.01, .01, 9)
+        zs = np.linspace(.0, .04, 11)
+        xx, zz = np.meshgrid(xs, zs, indexing='xy')
+        field = 1500. + 1200.*xx + 400.*zz
+        xi = np.linspace(-.008, .008, 7)
+        zi = np.linspace(.004, .036, 8)
+        target, mode = physical_resample_target(
+            {'c': torch.tensor(field, dtype=torch.float32),
+             'x_m': xs, 'z_m': zs}, {}, xi, zi)
+        xxq, zzq = np.meshgrid(xi, zi, indexing='ij')
+        expected = 1500. + 1200.*xxq + 400.*zzq
+        np.testing.assert_allclose(target.numpy(), expected, atol=2e-4)
+        self.assertEqual(mode, 'physical_coordinates')
+        with self.assertRaisesRegex(ValueError, 'physical x/z'):
+            physical_resample_target({'c': torch.tensor(field)}, {}, xi, zi)
 
     def test_geometry_flow_smoke_and_checkpoint(self):
         torch = self.torch

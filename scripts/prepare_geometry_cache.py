@@ -41,6 +41,8 @@ def parse_args():
     p.add_argument('--z0', type=float, default=.000075)
     p.add_argument('--z1', type=float, default=.043075)
     p.add_argument('--canonical-angle', type=float, default=8.)
+    p.add_argument('--allow-index-target-resize', action='store_true',
+                   help='legacy fallback when source SoS physical x/z axes are unavailable')
     p.add_argument('--pitch-m', type=float, default=None,
                    help='fallback element pitch when source metadata does not provide it')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
@@ -86,6 +88,58 @@ def augmentation_cfg(args):
     })
 
 
+def _find_axis(sample, metadata, names):
+    for source in (sample, metadata):
+        for name in names:
+            if name in source:
+                value = source[name]
+                if torch.is_tensor(value):
+                    value = value.detach().cpu().numpy()
+                value = np.asarray(value, np.float64).squeeze()
+                if value.ndim == 1 and value.size >= 2 and np.isfinite(value).all():
+                    return value
+    return None
+
+
+def physical_resample_target(sample, metadata, xi, zi, allow_index_resize=False):
+    """Sample source SoS on the same physical (x,z) grid as the DAS condition."""
+    source = sample['c']
+    if torch.is_tensor(source):
+        source = source.detach().cpu().numpy()
+    source = np.asarray(source, np.float64)
+    if source.ndim != 2 or not np.isfinite(source).all() or (source <= 0).any():
+        raise ValueError('Source sound-speed map must be finite positive 2-D data')
+    xs = _find_axis(sample, metadata, ('x_m', 'cx_m', 'cx', 'x', 'c_x_m'))
+    zs = _find_axis(sample, metadata, ('z_m', 'cz_m', 'cz', 'z', 'c_z_m'))
+    if xs is None or zs is None:
+        if not allow_index_resize:
+            raise ValueError(
+                'Source SoS physical x/z coordinates are required for geometry-flow targets; '
+                'use --allow-index-target-resize only to reproduce the legacy index resize')
+        target = F.interpolate(torch.as_tensor(source, dtype=torch.float32)[None, None],
+                               size=(len(zi), len(xi)), mode='bilinear',
+                               align_corners=True)[0, 0].T
+        return target.contiguous(), 'legacy_index_resize'
+
+    if source.shape == (len(zs), len(xs)):
+        c_zx = source
+    elif source.shape == (len(xs), len(zs)):
+        c_zx = source.T
+    else:
+        raise ValueError('Source SoS shape does not match its physical x/z axes')
+    if not (np.all(np.diff(xs) > 0) and np.all(np.diff(zs) > 0)):
+        raise ValueError('Source SoS x/z coordinates must be strictly increasing')
+    tol = 1e-9
+    if (xi[0] < xs[0]-tol or xi[-1] > xs[-1]+tol or
+            zi[0] < zs[0]-tol or zi[-1] > zs[-1]+tol):
+        raise ValueError('Requested geometry-flow target grid extends outside source SoS support')
+
+    along_x = np.stack([np.interp(xi, xs, row) for row in c_zx], axis=0)
+    out_zx = np.stack([np.interp(zi, zs, along_x[:, ix])
+                       for ix in range(len(xi))], axis=1)
+    return torch.from_numpy(out_zx.T.astype(np.float32)), 'physical_coordinates'
+
+
 def make_record(sample, record, args, device, variant=0):
     rf = sample['rf'].to(device)
     metadata = sample['metadata']
@@ -118,12 +172,13 @@ def make_record(sample, record, args, device, variant=0):
         ref_speed=args.ref_speed, n_subap=args.n_subap,
         event_mask=event_mask, element_mask=element_mask,
         t0_s=float(metadata.get('t0_s', 0.)), chunk=args.chunk)
-    target = F.interpolate(sample['c'].cpu()[None, None], size=(args.nz, args.nx),
-                           mode='bilinear', align_corners=True)[0, 0].T.contiguous()
+    target, target_resampling = physical_resample_target(
+        sample, metadata, xi, zi, allow_index_resize=args.allow_index_target_resize)
     u_gt = torch.log(target/1500.)/.05
     arrays = {
         'speed_events': condition['speed_events'].cpu().numpy().astype(np.complex64),
         'subap': condition['subap'].cpu().numpy().astype(np.complex64),
+        'subap_events': condition['subap_events'].cpu().numpy().astype(np.complex64),
         'event_geom': condition['event_geom'].numpy().astype(np.float32),
         'subap_geom': condition['subap_geom'].numpy().astype(np.float32),
         'global_geom': condition['global_geom'].numpy().astype(np.float32),
@@ -142,6 +197,7 @@ def make_record(sample, record, args, device, variant=0):
         'augmentation': applied, 'angles_deg': angles.tolist(), 'tx_t_ref_s': refs.tolist(),
         'fs_hz': fs, 'fc_hz': fc, 'pitch_m': pitch, 'c_steer': c_steer,
         'bandwidth_fraction': bandwidth_fraction(metadata, fc),
+        'target_resampling': target_resampling,
         'source_waveform_calibrated': False,
         'transmit_apodization_calibrated': False,
         'hardware_calibrated': False,
@@ -186,7 +242,7 @@ def main():
                               'source': record['id'], 'seconds': round(time.time()-start, 1)}),
                   flush=True)
     manifest = {
-        'version': 1,
+        'version': 2,
         'kind': 'structured_acquisition_sos',
         'data_root': str(root.resolve()),
         'records': manifest_records,
@@ -196,11 +252,14 @@ def main():
                       'ref_speed': args.ref_speed, 'n_subap': args.n_subap,
                       'canonical_angle_deg': args.canonical_angle,
                       'event_geom_dim': 4, 'subap_geom_dim': 4, 'global_geom_dim': 10,
-                      'event_order': 'physical angles, not fixed channel positions'},
+                      'event_order': 'physical angles, not fixed channel positions',
+                      'subap_layout': 'event-resolved [event, subap, x, z] plus compounded legacy view'},
         'augmentation': {'variants_per_train_record': args.augment_variants,
                          'augment_all': args.augment_all, 'seed': args.augment_seed,
                          'ranges': args.augmentation,
                          'constraint': 'RF-level timing/gain/spectral/noise/dropout; no independent phase randomisation'},
+        'target': {'grid_matches_condition': True,
+                   'fallback_index_resize_allowed': bool(args.allow_index_target_resize)},
         'provenance': {'source_waveform_calibrated': False,
                        'transmit_apodization_calibrated': False,
                        'hardware_calibrated': False},

@@ -32,13 +32,15 @@ def _mask(value, shape, device):
 
 
 def _group_scale(z, valid=None):
+    """Per-sample group RMS scale, preserving within-sample channel ratios."""
     rms = z.abs().square().mean(dim=(-2, -1)).sqrt()
     if valid is not None:
-        denom = valid.sum().clamp_min(1)
-        scale = (rms*valid).sum()/denom
+        valid = valid.to(rms.dtype)
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1)
+        scale = (rms*valid).sum(dim=1, keepdim=True)/denom
     else:
-        scale = rms.mean()
-    return scale.clamp_min(1e-30)
+        scale = rms.mean(dim=1, keepdim=True)
+    return scale.clamp_min(1e-30)[..., None, None]
 
 
 def _polar(z, scale):
@@ -129,6 +131,8 @@ class AcquisitionConditionEncoder(nn.Module):
             raise ValueError('Missing structured condition fields: ' + ', '.join(missing))
         speed_events = _as_complex(cond['speed_events'], 'speed_events')
         subap = _as_complex(cond['subap'], 'subap')
+        subap_events = (_as_complex(cond['subap_events'], 'subap_events')
+                        if 'subap_events' in cond else None)
         if speed_events.ndim != 5 or subap.ndim != 4:
             raise ValueError('Expected speed_events [B,S,A,H,W] and subap [B,K,H,W]')
         b, s, a, h, w = speed_events.shape
@@ -136,6 +140,8 @@ class AcquisitionConditionEncoder(nn.Module):
             raise ValueError('Condition groups must share batch and image shape')
         if s != len(self.speeds) or subap.shape[1] != self.n_subap:
             raise ValueError('Condition group count does not match encoder configuration')
+        if subap_events is not None and subap_events.shape != (b, a, self.n_subap, h, w):
+            raise ValueError('subap_events must be [B,A,K,H,W]')
         geom = cond['event_geom']
         subgeom = cond['subap_geom']
         glob = cond['global_geom']
@@ -145,10 +151,12 @@ class AcquisitionConditionEncoder(nn.Module):
             raise ValueError('subap_geom must be [B,K,%d]' % self.subap_geom_dim)
         if glob.shape != (b, self.global_geom_dim):
             raise ValueError('global_geom must be [B,%d]' % self.global_geom_dim)
-        return speed_events, subap, geom.float(), subgeom.float(), glob.float(), (b, s, a, h, w)
+        return (speed_events, subap, subap_events, geom.float(), subgeom.float(),
+                glob.float(), (b, s, a, h, w))
 
     def forward(self, cond, return_aux=False):
-        speed_events, subap, event_geom, subap_geom, global_geom, shape = self._validate(cond)
+        (speed_events, subap, subap_events, event_geom, subap_geom,
+         global_geom, shape) = self._validate(cond)
         b, s_count, n_event, h, w = shape
         device = speed_events.device
         event_mask = _mask(cond.get('event_mask'), (b, n_event), device)
@@ -209,6 +217,12 @@ class AcquisitionConditionEncoder(nn.Module):
         slots = torch.einsum('bak,bachw->bkchw', weights, features)
         event_out = slots.flatten(1, 2)
 
+        if subap_events is not None:
+            # Recompose receive sub-apertures from the same active transmit
+            # event set used by the full/event branches. This prevents masked
+            # transmit events leaking through a pre-compounded subap tensor.
+            subap = (subap_events * event_mask[:, :, None, None, None]
+                     .to(subap_events.dtype)).sum(dim=1)
         sub_gain = .1*torch.tanh(self.subap_gain(global_geom))[:, :, None, None]
         subap = subap*(1+sub_gain)*subap_mask[:, :, None, None]
         sub_scale = _group_scale(subap, subap_mask.float())
