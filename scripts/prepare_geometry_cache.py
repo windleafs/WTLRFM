@@ -124,6 +124,7 @@ def make_record(sample, record, args, device, variant=0):
     arrays = {
         'speed_events': condition['speed_events'].cpu().numpy().astype(np.complex64),
         'subap': condition['subap'].cpu().numpy().astype(np.complex64),
+        'subap_events': condition['subap_events'].cpu().numpy().astype(np.complex64),
         'event_geom': condition['event_geom'].numpy().astype(np.float32),
         'subap_geom': condition['subap_geom'].numpy().astype(np.float32),
         'global_geom': condition['global_geom'].numpy().astype(np.float32),
@@ -186,7 +187,7 @@ def main():
                               'source': record['id'], 'seconds': round(time.time()-start, 1)}),
                   flush=True)
     manifest = {
-        'version': 1,
+        'version': 2,
         'kind': 'structured_acquisition_sos',
         'data_root': str(root.resolve()),
         'records': manifest_records,
@@ -196,7 +197,8 @@ def main():
                       'ref_speed': args.ref_speed, 'n_subap': args.n_subap,
                       'canonical_angle_deg': args.canonical_angle,
                       'event_geom_dim': 4, 'subap_geom_dim': 4, 'global_geom_dim': 10,
-                      'event_order': 'physical angles, not fixed channel positions'},
+                      'event_order': 'physical angles, not fixed channel positions',
+                      'subap_layout': 'event-resolved [event, subap, x, z] plus compounded legacy view'},
         'augmentation': {'variants_per_train_record': args.augment_variants,
                          'augment_all': args.augment_all, 'seed': args.augment_seed,
                          'ranges': args.augmentation,
