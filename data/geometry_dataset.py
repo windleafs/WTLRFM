@@ -42,6 +42,13 @@ class StructuredSoSDataset(Dataset):
         self.seed = int(seed)
         if self.event_dropout_p < 0 or self.event_dropout_p >= 1:
             raise ValueError('event_dropout_p must be in [0,1)')
+        if self.event_dropout_p > 0:
+            first = self.cache_dir/self.records[0].get('cache_file', self.records[0]['id'] + '.npz')
+            with np.load(first, allow_pickle=False) as archive:
+                if 'subap_events' not in archive.files:
+                    raise ValueError(
+                        'Train-time event dropout requires cache v2 with subap_events; '
+                        'legacy compounded subap tensors would leak dropped transmit events')
 
     def __len__(self):
         return len(self.records)
