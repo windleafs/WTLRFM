@@ -1,0 +1,20 @@
+{
+  "name": "sos_abdominal",
+  "seed": 0,
+  "torch_threads": 4,
+  "data": {"cache": "cache_abdominal", "batch_size": 8, "num_workers": 0, "augment": false},
+  "unet": {
+    "in_channel": 21, "out_channel": 1, "inner_channel": 64,
+    "channel_mults": [1, 2, 4, 8], "attn_res": [16], "res_blocks": 2,
+    "dropout": 0.05, "image_size": 128, "cond_channels": 20,
+    "wtlr_channels": 64, "wtlr_levels": 3, "wtlr_wavelet": "haar",
+    "wtlr_res_blocks": 2, "wtlr_fusion": "gate", "use_dwt_resample": true,
+    "dwt_wavelet": "haar", "use_speckle_layer": false
+  },
+  "flow": {"u_clamp": 4.0, "u_source_scale": 1.0, "velocity_clamp": 8.0, "reflow_t_schedule": "stratified"},
+  "train": {
+    "n_epoch": 30, "lr": 0.00005, "weight_decay": 0.0, "grad_clip": 1.0,
+    "ema_decay": 0.99, "lr_schedule": "cosine", "val_every": 5, "background_weight": 0.1,
+    "ode_steps_val": 10, "n_samples_val": 2, "bf16": true, "eval_seed": 12345
+  }
+}

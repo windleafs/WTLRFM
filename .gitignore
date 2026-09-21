@@ -1,0 +1,81 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Python packaging and virtual environments
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Experiment outputs and generated artifacts
+out/
+runs/
+wandb/
+mlruns/
+checkpoints/
+*.log
+*.jsonl
+
+# Local ultrasound RF/IQ data and caches
+cache/
+datapw/
+data_cache/
+
+# Model weights and serialized tensors
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# Large numerical/data artifacts
+*.npz
+*.npy
+*.h5
+*.hdf5
+*.mat
+*.bin
+*.parquet
+*.feather
+
+# Archives and temporary files
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.rar
+*.tmp
+*.bak
+tmp/
+temp/

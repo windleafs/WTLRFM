@@ -1,0 +1,66 @@
+{
+  "name": "sos_mult_flow",
+  "seed": 0,
+  "data": {
+    "cache": "cache",
+    "batch_size": 8,
+    "num_workers": 8,
+    "augment": true,
+    "geom_aug": {
+      "_comment": "Shared warp of DAS condition + SoS target (train only). Not a re-acquisition; domain randomisation so the net does not lock onto the OpenBreast dome layout.",
+      "p": 0.8,
+      "translate_x_px": 10,
+      "translate_z_px": 16,
+      "rotate_deg": 12,
+      "scale_x": [0.85, 1.2],
+      "scale_z": [0.8, 1.25],
+      "elastic_amp_px": 5,
+      "elastic_sigma_px": 14
+    }
+  },
+  "condition": {
+    "_comment": "Phase-preserving DAS condition groups. full = full aperture at several assumed speeds (global SoS mismatch); angle = one image per transmit angle at ref_speed (transmit-leg phase); subap = receive sub-aperture images at ref_speed (arrival-time slope across the array). Channels = 2*(n_speeds + n_angle + n_subap) = 2*(3+13+4) = 40.",
+    "speeds": [1450, 1500, 1550],
+    "ref_speed": 1500.0,
+    "n_subap": 4,
+    "groups": ["full", "angle", "subap"]
+  },
+  "unet": {
+    "in_channel": 41,
+    "out_channel": 1,
+    "inner_channel": 64,
+    "channel_mults": [1, 2, 4, 8],
+    "attn_res": [16],
+    "res_blocks": 2,
+    "dropout": 0.05,
+    "image_size": 128,
+    "cond_channels": 40,
+    "wtlr_channels": 64,
+    "wtlr_levels": 3,
+    "wtlr_wavelet": "haar",
+    "wtlr_res_blocks": 2,
+    "wtlr_fusion": "gate",
+    "use_dwt_resample": true,
+    "dwt_wavelet": "haar",
+    "use_speckle_layer": false
+  },
+  "flow": {
+    "u_clamp": 4.0,
+    "u_source_scale": -1.0,
+    "velocity_clamp": 8.0,
+    "reflow_t_schedule": "stratified"
+  },
+  "train": {
+    "n_epoch": 300,
+    "lr": 0.00005,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "ema_decay": 0.999,
+    "lr_schedule": "cosine",
+    "log_every": 20,
+    "val_every": 5,
+    "save_every": 25,
+    "ode_steps_val": 10,
+    "n_samples_val": 4
+  }
+}
