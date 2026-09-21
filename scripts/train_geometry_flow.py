@@ -175,18 +175,36 @@ def main():
         collate_fn=geometry_collate, pin_memory=True,
         persistent_workers=args.workers > 0)
     manifest = train_set.manifest
-    cond = manifest['condition']
-    speeds = cond.get('speeds', [1450., 1500., 1550.])
-    ref_speed = cond.get('ref_speed', speeds[1])
-    ref_index = int(np.flatnonzero(np.isclose(speeds, ref_speed))[0])
-    encoder_cfg = dict(speeds=speeds, ref_speed_index=ref_index,
-                       n_event_slots=args.event_slots, n_subap=cond.get('n_subap', 4),
-                       canonical_angle_deg=args.canonical_angle,
-                       event_bandwidth_deg=args.event_bandwidth,
-                       hidden_channels=args.hidden_channels,
-                       event_geom_dim=cond.get('event_geom_dim', 4),
-                       global_geom_dim=cond.get('global_geom_dim', 10),
-                       subap_geom_dim=cond.get('subap_geom_dim', 4))
+    cond = dict(manifest.get('condition', {}))
+    probe = train_set[0]['condition']
+    n_speed = int(probe['speed_events'].shape[0])
+    if 'speeds' in cond:
+        speeds = [float(v) for v in cond['speeds']]
+    elif n_speed == 3:
+        speeds = [1450., 1500., 1550.]
+    else:
+        raise ValueError(
+            'Legacy structured manifest has no condition.speeds and the cache '
+            f'contains {n_speed} speed groups; add the physical assumed speeds '
+            'to manifest["condition"]["speeds"] before training')
+    if len(speeds) != n_speed:
+        raise ValueError('Manifest speed count does not match cached speed_events')
+    ref_speed = float(cond.get('ref_speed', 1500. if 1500. in speeds
+                               else speeds[len(speeds)//2]))
+    matches = np.flatnonzero(np.isclose(speeds, ref_speed))
+    if len(matches) != 1:
+        raise ValueError('Reference speed must identify exactly one cached speed group')
+    ref_index = int(matches[0])
+    encoder_cfg = dict(
+        speeds=speeds, ref_speed_index=ref_index,
+        n_event_slots=args.event_slots,
+        n_subap=int(cond.get('n_subap', probe['subap'].shape[0])),
+        canonical_angle_deg=args.canonical_angle,
+        event_bandwidth_deg=args.event_bandwidth,
+        hidden_channels=args.hidden_channels,
+        event_geom_dim=int(cond.get('event_geom_dim', probe['event_geom'].shape[-1])),
+        global_geom_dim=int(cond.get('global_geom_dim', probe['global_geom'].shape[-1])),
+        subap_geom_dim=int(cond.get('subap_geom_dim', probe['subap_geom'].shape[-1])))
 
     pretrained_blob = None
     unet = dict(cfg['unet'])
