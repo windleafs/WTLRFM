@@ -142,6 +142,25 @@ class GeometryAcquisitionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_augmentation({'event_dropout_p': 1.})
 
+    def test_physical_target_resampling(self):
+        torch = self.torch
+        from scripts.prepare_geometry_cache import physical_resample_target
+        xs = np.linspace(-.01, .01, 9)
+        zs = np.linspace(.0, .04, 11)
+        xx, zz = np.meshgrid(xs, zs, indexing='xy')
+        field = 1500. + 1200.*xx + 400.*zz
+        xi = np.linspace(-.008, .008, 7)
+        zi = np.linspace(.004, .036, 8)
+        target, mode = physical_resample_target(
+            {'c': torch.tensor(field, dtype=torch.float32),
+             'x_m': xs, 'z_m': zs}, {}, xi, zi)
+        xxq, zzq = np.meshgrid(xi, zi, indexing='ij')
+        expected = 1500. + 1200.*xxq + 400.*zzq
+        np.testing.assert_allclose(target.numpy(), expected, atol=2e-4)
+        self.assertEqual(mode, 'physical_coordinates')
+        with self.assertRaisesRegex(ValueError, 'physical x/z'):
+            physical_resample_target({'c': torch.tensor(field)}, {}, xi, zi)
+
     def test_geometry_flow_smoke_and_checkpoint(self):
         torch = self.torch
         from models.geometry_flow import GeometryAwareSoSFlow
