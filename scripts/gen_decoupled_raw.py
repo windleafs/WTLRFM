@@ -35,7 +35,8 @@ for p in (NEURAL_ASP, ULTRAWAVE_BENCH, PHANTOM_DIR):
 
 import scripts.generate_l11_ultrawave_raw as gen  # noqa: E402
 
-VARIANTS = ('reseed', 'texture', 'cswap', 'homoc')
+VARIANTS = ('reseed', 'texture', 'cswap', 'homoc',
+            'calibhom', 'calibuni')  # v4 calibration variants
 # dual_scale table values (build_acoustic_l11.DUAL_SCALE_TISSUES)
 GLAND_C, FAT_C = 1560., 1455.
 GLAND_NEW = (1510., 1590.)   # redraw range for gland macro speed
@@ -115,11 +116,32 @@ def make_variant(plane, case, base_seed, variant, rng_seed):
         maps, *_ = gen.medium_builder.build_medium(*args, seed=base_seed+202,
                                                    preset='dual_scale')
         maps['sound_speed'] = np.full_like(maps['sound_speed'], 1500.)
+    elif variant == 'calibhom':
+        # breast-textured reflectivity, homogeneous random absolute speed
+        maps, *_ = gen.medium_builder.build_medium(*args, seed=base_seed+202,
+                                                   preset='dual_scale')
+        c_rand = float(np.random.default_rng(base_seed+505).uniform(1450., 1580.))
+        maps['sound_speed'] = np.full_like(maps['sound_speed'], c_rand)
+    elif variant == 'calibuni':
+        # uniform-speckle reflectivity (no breast structure), random speed
+        shape = (len(case['z']), len(case['x']))
+        zz, xx = np.meshgrid(case['z'], case['x'], indexing='ij')
+        rng = np.random.default_rng(base_seed+606)
+        mult = rng.uniform(.3, 2.2)
+        speckle = rng.normal(0., 8.*mult, shape)*(zz*1e3 >= 0.)
+        maps = {'sound_speed': np.full(shape, float(
+                    rng.uniform(1450., 1580.)), np.float32),
+                'density': (1000.+speckle).astype(np.float32),
+                'alpha_coeff': np.full(shape, .002, np.float32),
+                'BonA': np.zeros(shape, np.float32)}
+        return maps
     else:
         raise ValueError(variant)
     gel_rows = (case['z']*1e3) < 1.0
     if variant == 'homoc':
         maps['sound_speed'][gel_rows, :] = 1500.
+    elif variant == 'calibhom':
+        maps['sound_speed'][gel_rows, :] = maps['sound_speed'][0, 0]
     return maps
 
 
@@ -173,6 +195,8 @@ def main():
     p.add_argument('--planes', type=int, default=120,
                    help='training planes to use (every 4th of 480)')
     p.add_argument('--shard', default='0/1', help='i/n worker shard')
+    p.add_argument('--skip-v2-variants', action='store_true',
+                   help='generate only the v4 calibration variants')
     args = p.parse_args()
     if 'torch' in sys.modules:
         raise RuntimeError('torch must not be imported in this process')
@@ -182,7 +206,14 @@ def main():
     trains = [r for r in index['samples'] if r['split'] == 'train']
     planes = trains[::4][:args.planes]
     i, n = (int(v) for v in args.shard.split('/'))
-    work = [(rec, v) for rec in planes for v in VARIANTS][i::n]
+    v4_planes = {'calibhom': planes[:len(planes)//2],
+                 'calibuni': planes[len(planes)//2:]}
+    work = [(rec, v) for rec in planes
+            for v in ('reseed', 'texture', 'cswap', 'homoc')
+            ] if args.skip_v2_variants else []
+    if not args.skip_v2_variants:
+        work += [(rec, v) for v, ps in v4_planes.items() for rec in ps]
+    work = work[i::n]
     start = time.monotonic()
     for k, (rec, variant) in enumerate(work, 1):
         status = simulate_record(args.root, rec, args.out, variant)
