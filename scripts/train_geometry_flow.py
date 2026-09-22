@@ -21,6 +21,9 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config', default=str(ROOT/'configs/sos_flow.json'))
     p.add_argument('--cache', required=True, type=Path)
+    p.add_argument('--extra-train-cache', type=Path,
+                   help='additional structured cache whose train split is '
+                        'concatenated for training (val/test stay primary)')
     p.add_argument('--out', required=True, type=Path)
     p.add_argument('--pretrained', type=Path)
     p.add_argument('--adapter-only', action='store_true',
@@ -165,10 +168,17 @@ def main():
         seed=args.seed, limit=args.limit)
     val_limit = max(1, args.limit//4) if args.limit else 0
     val_set = StructuredSoSDataset(args.cache, 'val', limit=val_limit)
+    train_dataset = train_set
+    if args.extra_train_cache:
+        extra = StructuredSoSDataset(
+            args.extra_train_cache, 'train', event_dropout_p=args.event_dropout,
+            min_events=args.min_events, lateral_mirror=args.lateral_mirror,
+            seed=args.seed + 7919, limit=args.limit)
+        train_dataset = torch.utils.data.ConcatDataset([train_set, extra])
     batch_size = int(args.batch_size or cfg['data'].get('batch_size', 4))
     train_loader = torch.utils.data.DataLoader(
-        train_set, batch_size=batch_size, shuffle=True, num_workers=args.workers,
-        collate_fn=geometry_collate, drop_last=len(train_set) > batch_size,
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=args.workers,
+        collate_fn=geometry_collate, drop_last=len(train_dataset) > batch_size,
         pin_memory=True, persistent_workers=args.workers > 0)
     val_loader = torch.utils.data.DataLoader(
         val_set, batch_size=batch_size, shuffle=False, num_workers=args.workers,
@@ -217,12 +227,15 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=int(args.epochs or cfg['train']['n_epoch']), eta_min=1e-6)
     ema = EMA(model, decay=cfg['train'].get('ema_decay', .999))
-    log(f'device={device} train={len(train_set)} val={len(val_set)} '
+    log(f'device={device} train={len(train_dataset)} '
+        f'(primary {len(train_set)} + extra '
+        f'{len(train_dataset)-len(train_set)}) val={len(val_set)} '
         f'encoder_channels={model.encoder.out_channels} '
         f'trainable={sum(p.numel() for p in parameters)/1e6:.3f}M '
         f'adapter_only={args.adapter_only}')
 
     config = {'args': vars(args), 'encoder': encoder_cfg, 'unet': model.flow.cfg,
+              'n_train': len(train_dataset),
               'pretrained': str(args.pretrained) if args.pretrained else None,
               'pretrained_info': pretrained_info, 'manifest': manifest,
               'note': 'Structured event aggregation; angle semantics are physical values, not channel order.'}

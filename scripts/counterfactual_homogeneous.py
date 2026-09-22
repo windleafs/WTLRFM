@@ -45,6 +45,7 @@ REGIONS = {'background': None, 'bright_points': None, 'arc': None,
 
 def build_maps(shape, x, z, seed=20260922):
     """Density-only reflectivity on an exactly homogeneous SoS medium."""
+    # seed controls ONLY the scatterer realization; the layout is fixed.
     zz, xx = np.meshgrid(z, x, indexing='ij')            # [nz, nx] metres
     xmm, zmm = xx*1e3, zz*1e3
     rng = np.random.default_rng(seed)
@@ -84,6 +85,12 @@ def build_maps(shape, x, z, seed=20260922):
 
 
 def stage_sim(args):
+    seeds = [int(v) for v in args.speckle_seeds.split(',') if v != '']
+    for seed in seeds:
+        stage_sim_one(args, seed)
+
+
+def stage_sim_one(args, seed):
     sys.path.insert(0, '/home/zhuangyang/fmmodel/neural_asp')
     sys.path.insert(0, '/home/zhuangyang/fmmodel/UltraWave/benchmarks')
     sys.path.insert(0, '/data/zhuangyang/NumerialBreastPhantoms')
@@ -94,7 +101,8 @@ def stage_sim(args):
     start = time.monotonic()
     args.out.mkdir(parents=True, exist_ok=True)
     case = gen.geometry_case()
-    maps = build_maps((len(case['z']), len(case['x'])), case['x'], case['z'])
+    maps = build_maps((len(case['z']), len(case['x'])), case['x'], case['z'],
+                      seed=seed)
     case['maps'] = maps
     gen.bench.validate_case(case)
     fit = gen.absorption_model(case)
@@ -123,8 +131,8 @@ def stage_sim(args):
                 'arc_radius': ARC_RADIUS, 'hyper_rect': HYPER_RECT,
                 'hypo_rect': HYPO_RECT, 'cysts': CYSTS,
                 'cyst_radius': CYST_RADIUS, 'boundary_z': BOUNDARY_Z}}
-    np.savez_compressed(args.out/'counterfactual_rf.npz', rf=rf,
-                        meta_json=np.asarray(json.dumps(meta)))
+    out_rf = args.out/f'counterfactual_rf_s{seed}.npz'
+    np.savez_compressed(out_rf, rf=rf, meta_json=np.asarray(json.dumps(meta)))
     print(f'[sim] wrote {args.out}/"counterfactual_rf.npz" '
           f'rf_rms={float(rf.std()):.1f}', flush=True)
 
@@ -167,26 +175,36 @@ def stage_infer(args):
     from models.geometry_flow import GeometryAwareSoSFlow
     from train_geometry_flow import grid_metrics
 
-    blob_npz = np.load(args.out/'counterfactual_rf.npz', allow_pickle=False)
-    meta = json.loads(str(blob_npz['meta_json'].item()))
-    rf = blob_npz['rf']                                     # [11, 192, 2401]
-    xe = (np.arange(rf.shape[1]) - (rf.shape[1]-1)/2)*2e-4
-    cond = structured_condition(
-        rf, xe, np.asarray(meta['angles_deg']),
-        np.asarray(meta['source_tref_s']), G.x_grid(), G.z_grid(),
-        meta['fs_hz'], meta['fc_hz'], 1500., 0.2333, t0_s=0., chunk=4096)
     device = torch.device(args.device)
-    condition = {k: (v.to(device)[None] if torch.is_tensor(v) else v)
-                 for k, v in cond.items()}
     blob = torch.load(args.ckpt, map_location='cpu', weights_only=False)
     model = GeometryAwareSoSFlow(unet=blob['unet'], encoder=blob['encoder_cfg'],
                                  u_source_scale=-1.).to(device).eval()
     model.load_state_dict(blob['state_dict'])
-    torch.manual_seed(20260922)
-    with torch.no_grad():
-        draws = model.sample(condition, n_steps=10, n_samples=16)
-    pred = draws.mean(0)[0, 0].cpu().numpy()
-    std = draws.std(0, unbiased=False)[0, 0].cpu().numpy()
+
+    files = sorted(args.out.glob('counterfactual_rf_s*.npz'))
+    if not files:
+        raise FileNotFoundError('run --stage sim first (with --speckle-seeds)')
+    preds = {}
+    for path in files:
+        seed_tag = path.stem.split('_s')[-1]
+        blob_npz = np.load(path, allow_pickle=False)
+        meta = json.loads(str(blob_npz['meta_json'].item()))
+        rf = blob_npz['rf']                                 # [11, 192, 2401]
+        xe = (np.arange(rf.shape[1]) - (rf.shape[1]-1)/2)*2e-4
+        cond = structured_condition(
+            rf, xe, np.asarray(meta['angles_deg']),
+            np.asarray(meta['source_tref_s']), G.x_grid(), G.z_grid(),
+            meta['fs_hz'], meta['fc_hz'], 1500., 0.2333, t0_s=0., chunk=4096)
+        condition = {k: (v.to(device)[None] if torch.is_tensor(v) else v)
+                     for k, v in cond.items()}
+        torch.manual_seed(20260922)
+        with torch.no_grad():
+            draws = model.sample(condition, n_steps=10, n_samples=16)
+        preds[seed_tag] = draws.mean(0)[0, 0].cpu().numpy()
+        print(f'[infer] seed {seed_tag}: mean={preds[seed_tag].mean():.1f}',
+              flush=True)
+    pred = next(iter(preds.values()))
+    std = np.stack(list(preds.values())).std(axis=0)   # across realizations
 
     masks = region_masks(G.x_grid().astype(np.float64),
                          G.z_grid().astype(np.float64))
@@ -220,12 +238,30 @@ def stage_infer(args):
                      | masks['hypoechoic'] | masks['strong_boundary']
                      | masks['anechoic']]
     shortcut_corr = float(np.corrcoef(a, b)[0, 1])
+
+    # --- acceptance metrics (see discussion 2026-09-22):
+    # B_homo: global prior bias on an exactly-homogeneous medium
+    # S_texture: worst region-vs-background contrast induced by texture alone
+    # V_speckle: pixel-wise prediction spread across scatterer realizations
+    zmm_roi = np.meshgrid(G.x_grid()*1e3, G.z_grid()*1e3, indexing='ij')[1]
+    roi_all = (zmm_roi >= 3.) & (zmm_roi <= 45.)
+    B_homo = float(abs(pred[roi_all].mean() - C_HOMOGENEOUS))
+    S_texture = float(max(abs(v['mean']-stats['background']['mean'])
+                          for k, v in stats.items() if k != 'background'))
+    V_speckle = float(std[roi_all].mean())
     report = {'metrics_vs_1500': metrics, 'regions': stats,
-              'shortcut_corr': shortcut_corr, 'meta': meta}
+              'shortcut_corr': shortcut_corr,
+              'B_homo': B_homo, 'S_texture': S_texture,
+              'V_speckle': V_speckle, 'n_speckle_seeds': len(preds),
+              'meta': meta}
     (args.out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
     print(json.dumps({'regions': {k: round(v['dev'], 1) for k, v in stats.items()},
                       'roi_mae': round(metrics['roi_mae'], 2),
-                      'shortcut_corr': round(shortcut_corr, 3)}, indent=2),
+                      'shortcut_corr': round(shortcut_corr, 3),
+                      'B_homo': round(B_homo, 2),
+                      'S_texture': round(S_texture, 2),
+                      'V_speckle': round(V_speckle, 2),
+                      'n_speckle_seeds': len(preds)}, indent=2),
           flush=True)
 
     import matplotlib
@@ -266,6 +302,9 @@ def stage_infer(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--stage', required=True, choices=('sim', 'infer'))
+    p.add_argument('--speckle-seeds', default='20260922',
+                   help='comma list of scatterer seeds; each seed re-simulates '
+                        'the identical layout with a new realization')
     p.add_argument('--root', type=Path,
                    default=Path('/data/zhuangyang/NumerialBreastPhantoms/'
                                 'l11_ultrawave_500_11angle'))
