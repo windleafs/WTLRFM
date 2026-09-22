@@ -40,8 +40,15 @@ def parse_args():
     p.add_argument('--ode-steps', type=int, default=10)
     p.add_argument('--n-samples', type=int, default=2)
     p.add_argument('--sample-seed', type=int, default=20260921)
+    p.add_argument('--split', default='val',
+                   help='cache split to evaluate (val was used for model '
+                        'selection; report headline numbers on test)')
     p.add_argument('--ids', default='',
-                   help='comma list of val record ids; default = whole val split')
+                   help='comma list of record ids; default = whole split')
+    p.add_argument('--drop-sync-global', action='store_true',
+                   help='rewrite global_geom event-count/fill to K/16 and 1.0 '
+                        'when dropping, i.e. simulate a true K-angle '
+                        'acquisition instead of an 11-angle dropout')
     p.add_argument('--seeds', type=int, default=3,
                    help='random repetitions for drop/permute modes')
     p.add_argument('--ks', default='11,9,7,5,3')
@@ -88,16 +95,26 @@ def clone_condition(batch):
             for k, v in batch['condition'].items()}
 
 
-def perturb_drop(batch, k, seed, base_index):
+def perturb_drop(batch, k, seed, base_index, sync_global=False):
+    """Keep a random subset of the *active* events.
+
+    Default: pure dropout (global_geom still describes the full acquisition).
+    With sync_global: also rewrite the event-count/fill entries of
+    global_geom so the condition describes a true K-angle acquisition.
+    """
     cond = clone_condition(batch)
     mask = cond['event_mask']
-    n_events = mask.shape[1]
+    geom = cond['global_geom']
     for b in range(mask.shape[0]):
+        active = torch.nonzero(mask[b], as_tuple=False).flatten().cpu().numpy()
         rng = np.random.default_rng(1000003 + 1009*seed + 37*int(base_index+b))
-        keep = rng.choice(n_events, size=int(k), replace=False)
-        row = torch.zeros(n_events, dtype=torch.bool, device=mask.device)
+        keep = rng.choice(active, size=min(int(k), active.size), replace=False)
+        row = torch.zeros(mask.shape[1], dtype=torch.bool, device=mask.device)
         row[torch.from_numpy(keep).to(mask.device)] = True
         mask[b] = row
+        if sync_global:
+            geom[b, 6] = float(len(keep))/16.
+            geom[b, 8] = 1.
     return cond
 
 
@@ -151,12 +168,12 @@ def main():
     device = torch.device(args.device)
     set_seed(args.sample_seed)
     model, blob = load_model(args.ckpt, device, args.model)
-    dataset = StructuredSoSDataset(args.cache, 'val')
+    dataset = StructuredSoSDataset(args.cache, args.split)
     if args.ids:
         wanted = [v for v in args.ids.split(',') if v]
         dataset.records = [r for r in dataset.records if r['id'] in wanted]
         if not dataset.records:
-            raise FileNotFoundError('No matching val ids in the cache')
+            raise FileNotFoundError('No matching ids in the cache split')
     ks = [int(v) for v in args.ks.split(',')]
     shifts = [float(v) for v in args.shifts.split(',')]
 
@@ -193,7 +210,8 @@ def main():
                 torch.manual_seed(args.sample_seed + 17)
                 state['index'] = 0
                 m = run_pass(model, dataset, device, args,
-                             with_index(lambda b, i: perturb_drop(b, k, seed, i)))
+                             with_index(lambda b, i: perturb_drop(
+                                 b, k, seed, i, sync_global=args.drop_sync_global)))
             per_seed.append(m)
         agg = {key: float(np.mean([m[key] for m in per_seed])) for key in per_seed[0]}
         agg['std_roi_mae'] = float(np.std([m['roi_mae'] for m in per_seed]))
@@ -223,7 +241,8 @@ def main():
 
     report = {
         'ckpt': str(args.ckpt), 'model': args.model, 'cache': str(args.cache),
-        'val_samples': len(dataset), 'ode_steps': args.ode_steps,
+        'split': args.split, 'drop_sync_global': bool(args.drop_sync_global),
+        'n_records': len(dataset), 'ode_steps': args.ode_steps,
         'n_samples': args.n_samples, 'seeds': args.seeds,
         'results': results,
         'note': ('event_geom = [sin(theta), cos(theta), theta/45deg, tx_ref_us]; '

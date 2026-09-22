@@ -21,10 +21,12 @@ import torch
 SRC_ROOT = Path('/data/zhuangyang/NumerialBreastPhantoms/l11_ultrawave_500_11angle')
 UNION_ANGLES = [-7.5, -6.0, -4.5, -3.0, -1.5, 0.5, 2.5, 4.5, 6.5]
 UNSEEN_5 = [-7.5, -4.5, -1.5, 2.5, 6.5]
+EXTREME_ANGLES = [-11.0, -7.7, -3.3, 3.3, 7.7, 11.0]
 
 
-def pack_root(sim_dir, out_root, subset, ids):
-    idx = [i for i, a in enumerate(UNION_ANGLES) if a in subset]
+def pack_root(sim_dir, out_root, subset, ids, union=None):
+    union = UNION_ANGLES if union is None else union
+    idx = [i for i, a in enumerate(union) if a in subset]
     if len(idx) != len(subset):
         raise ValueError('subset angles missing from the union set')
     out_root.mkdir(parents=True, exist_ok=True)
@@ -42,7 +44,7 @@ def pack_root(sim_dir, out_root, subset, ids):
             'backend': src['backend'],
             'base_anatomy_id': src['base_anatomy_id'],
             'anatomy_repeated': src['anatomy_repeated'],
-            'angles_deg': [UNION_ANGLES[i] for i in idx],
+            'angles_deg': [union[i] for i in idx],
             'source_tref_s': [meta['source_tref_s'][i] for i in idx],
             'fs_hz': 40e6, 'band_hz': [4e6, 7.5e6], 'source_f0_hz': 7.5e6,
             'native_dt_s': 2.5e-9, 'native_nt': 24001, 'space_order': 8,
@@ -73,10 +75,15 @@ def main():
     p.add_argument('--out-base', type=Path,
                    default=Path('/data/zhuangyang/tmp'))
     p.add_argument('--ids', default=','.join(f'val_{i:03d}' for i in range(0, 60, 4)))
+    p.add_argument('--set', choices=('unseen', 'extreme'), default='unseen')
     args = p.parse_args()
     ids = [v for v in args.ids.split(',') if v]
-    pack_root(args.sim_dir, args.out_base/'unseen5_root', UNSEEN_5, ids)
-    pack_root(args.sim_dir, args.out_base/'unseen9_root', UNION_ANGLES, ids)
+    if args.set == 'unseen':
+        pack_root(args.sim_dir, args.out_base/'unseen5_root', UNSEEN_5, ids)
+        pack_root(args.sim_dir, args.out_base/'unseen9_root', UNION_ANGLES, ids)
+    else:
+        pack_root(args.sim_dir, args.out_base/'extreme_root', EXTREME_ANGLES,
+                  ids, union=EXTREME_ANGLES)
 
 
 if __name__ == '__main__':

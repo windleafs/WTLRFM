@@ -34,6 +34,9 @@ import scripts.generate_l11_ultrawave_raw as gen  # noqa: E402
 # Union of unseen angle sets; none of these lie on the 1.6-degree training grid.
 UNION_ANGLES = [-7.5, -6.0, -4.5, -3.0, -1.5, 0.5, 2.5, 4.5, 6.5]
 UNSEEN_5 = [-7.5, -4.5, -1.5, 2.5, 6.5]
+# Extrapolation set: +/-11 deg lie outside the trained +/-8 deg span.
+EXTREME_ANGLES = [-11.0, -7.7, -3.3, 3.3, 7.7, 11.0]
+ANGLE_SETS = {'unseen': UNION_ANGLES, 'extreme': EXTREME_ANGLES}
 
 
 def solver_case(maps=None):
@@ -56,7 +59,9 @@ def main():
     p.add_argument('--out', required=True, type=Path)
     p.add_argument('--ids', default=','.join(f'val_{i:03d}' for i in range(0, 60, 4)))
     p.add_argument('--sanity-only', action='store_true')
+    p.add_argument('--angle-set', choices=list(ANGLE_SETS), default='unseen')
     args = p.parse_args()
+    angles = ANGLE_SETS[args.angle_set]
     if 'torch' in sys.modules:
         raise RuntimeError('torch must not be imported in this process')
     gen.configure_gpu()
@@ -98,7 +103,7 @@ def main():
         return
 
     # --- Reference fields at the unseen angles (shared across samples).
-    refs_path = args.out/'reference_unseen.npz'
+    refs_path = args.out/f'reference_{args.angle_set}.npz'
     if refs_path.exists():
         refs = np.load(refs_path)['rf_native']
         print('[refs] reusing cached unseen-angle reference', flush=True)
@@ -106,14 +111,14 @@ def main():
         case, fit, solver = solver_case()
         values = []
         start = time.monotonic()
-        for angle in UNION_ANGLES:
+        for angle in angles:
             _, total, timing = run_angle(solver, case, angle)
             values.append(total)
             print(f'[refs] angle={angle:+.1f} solve={timing["solve_readback_s"]:.2f}s '
                   f'elapsed={time.monotonic()-start:.1f}s', flush=True)
         refs = np.stack(values, axis=-1)
         tmp = refs_path.with_suffix('.tmp.npz')
-        np.savez(tmp, rf_native=refs, angles_deg=np.asarray(UNION_ANGLES))
+        np.savez(tmp, rf_native=refs, angles_deg=np.asarray(angles))
         tmp.replace(refs_path)
 
     # --- Per-sample simulation at the unseen angles.
@@ -137,7 +142,7 @@ def main():
         fit = gen.absorption_model(case)
         solver = gen.solver_for(case, maps, fit)
         rf_list, trefs = [], []
-        for ai, angle in enumerate(UNION_ANGLES):
+        for ai, angle in enumerate(angles):
             tref, total, timing = run_angle(solver, case, angle)
             rf, _ = gen.sim.analytic_channels(total - refs[:, :, ai], gen.DT,
                                               band=[4e6, 7.5e6])
@@ -152,7 +157,8 @@ def main():
                                              ('id', 'split', 'case', 'h5', 'z_index',
                                               'scatter_seed', 'base_anatomy_id',
                                               'anatomy_repeated', 'backend')},
-                'angles_deg': UNION_ANGLES, 'source_tref_s': trefs,
+                'angles_deg': list(angles), 'source_tref_s': trefs,
+                'angle_set': args.angle_set,
                 'elapsed_s': time.monotonic()-start}
         tmp = out_path.with_suffix('.tmp.npz')
         np.savez_compressed(tmp, rf=rf)
