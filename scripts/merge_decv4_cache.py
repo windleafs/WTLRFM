@@ -17,6 +17,9 @@ def main():
                    default=Path('/data/zhuangyang/geometry_flow_v2_calib_cache'))
     p.add_argument('--out', type=Path,
                    default=Path('/data/zhuangyang/geometry_flow_v2_decv4_cache'))
+    p.add_argument('--also', default='',
+                   help='comma list of extra caches whose records are '
+                        'appended verbatim (symlinked)')
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     dec = json.loads((args.dec_cache/'manifest.json').read_text())
@@ -30,10 +33,17 @@ def main():
             if not target.exists():
                 target.symlink_to(src_dir/r['cache_file'])
             records.append(r)
+    for extra in [Path(v) for v in args.also.split(',') if v]:
+        em = json.loads((extra/'manifest.json').read_text())
+        for r in em['records']:
+            target = args.out/r['cache_file']
+            if not target.exists():
+                target.symlink_to(extra/r['cache_file'])
+            records.append(r)
     merged = dict(dec)
     merged['records'] = records
-    merged['note'] = ('v4 mixture: 360 decoupled v2 variants (reseed/texture/'
-                      'cswap) + 120 v4 calibration variants (calibhom/calibuni)')
+    merged['note'] = ('mixed counterfactual cache: dec variants + calibration '
+                      'variants' + (' + ' + args.also if args.also else ''))
     (args.out/'manifest.json').write_text(json.dumps(merged, indent=2)+'\n')
     counts = {}
     for r in records:
