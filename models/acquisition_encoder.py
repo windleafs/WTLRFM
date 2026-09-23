@@ -43,6 +43,25 @@ def _group_scale(z, valid=None):
     return scale.clamp_min(1e-30)[..., None, None]
 
 
+def _depth_scale(z, group_scale, smooth=15, floor=0.08):
+    """TGC-style per-depth-row scale for the polar magnitude encoding.
+
+    Two-way attenuation leaves deep rows 1-2 orders below the group RMS that
+    sets the asinh scale, so deep magnitude features are compressed to ~0.
+    Dividing by a smoothed per-row RMS restores their dynamic range; the
+    floor keeps empty/echo-free rows from being boosted to full scale.
+    """
+    # depth is the LAST axis in every condition group ([.., nx, nz])
+    reduce = tuple(d for d in range(z.ndim-1))
+    row_rms = z.abs().square().mean(dim=reduce, keepdim=True).sqrt()
+    row_rms = row_rms.reshape(z.shape[0], 1, 1, z.shape[-1])   # [B,1,1,nz]
+    k = int(smooth) | 1
+    row_rms = torch.nn.functional.avg_pool1d(
+        row_rms.squeeze(1).squeeze(1)[None], kernel_size=k, stride=1,
+        padding=k//2)[0].unsqueeze(1).unsqueeze(1)
+    return torch.maximum(row_rms, floor*group_scale).clamp_min(1e-30)
+
+
 def _polar(z, scale):
     mag = torch.asinh(z.abs()/scale)/np.arcsinh(3.)
     # Use a smooth unit phasor instead of atan2: atan2(0, 0) has an undefined
@@ -73,7 +92,9 @@ class AcquisitionConditionEncoder(nn.Module):
     def __init__(self, speeds=(1450., 1500., 1550.), ref_speed_index=1,
                  n_event_slots=11, n_subap=4, canonical_angle_deg=8.,
                  event_bandwidth_deg=2., hidden_channels=16,
-                 event_geom_dim=4, global_geom_dim=10, subap_geom_dim=4):
+                 event_geom_dim=4, global_geom_dim=10, subap_geom_dim=4,
+                 depth_tgc=False, tgc_smooth=15, tgc_floor=.08,
+                 q_rel_eps=0.):
         super().__init__()
         self.speeds = tuple(float(c) for c in speeds)
         self.ref_speed_index = int(ref_speed_index)
@@ -83,6 +104,15 @@ class AcquisitionConditionEncoder(nn.Module):
         self.event_geom_dim = int(event_geom_dim)
         self.global_geom_dim = int(global_geom_dim)
         self.subap_geom_dim = int(subap_geom_dim)
+        # Depth-response options: two-way attenuation leaves deep complex-DAS
+        # rows far below the group RMS, compressing their polar magnitude and
+        # zeroing the relative-phase q (its absolute 1e-12 floor dominates
+        # once |e|*|r| falls below it).  depth_tgc rescales rows TGC-style;
+        # q_rel_eps > 0 makes that floor relative to the group RMS.
+        self.depth_tgc = bool(depth_tgc)
+        self.tgc_smooth = int(tgc_smooth)
+        self.tgc_floor = float(tgc_floor)
+        self.q_rel_eps = float(q_rel_eps)
         if len(self.speeds) < 1 or not (0 <= self.ref_speed_index < len(self.speeds)):
             raise ValueError('Invalid speed group/ref_speed_index')
         if self.n_event_slots < 2 or self.n_subap < 1 or self.canonical_angle_deg <= 0:
@@ -95,7 +125,9 @@ class AcquisitionConditionEncoder(nn.Module):
                         hidden_channels=hidden_channels,
                         event_geom_dim=self.event_geom_dim,
                         global_geom_dim=self.global_geom_dim,
-                        subap_geom_dim=self.subap_geom_dim)
+                        subap_geom_dim=self.subap_geom_dim,
+                        depth_tgc=self.depth_tgc, tgc_smooth=self.tgc_smooth,
+                        tgc_floor=self.tgc_floor, q_rel_eps=self.q_rel_eps)
 
         canonical = np.deg2rad(np.linspace(-self.canonical_angle_deg,
                                            self.canonical_angle_deg,
@@ -173,6 +205,9 @@ class AcquisitionConditionEncoder(nn.Module):
         gain = .1*torch.tanh(self.full_gain(global_geom))[:, :, None, None]
         full = full*(1+gain)
         full_scale = _group_scale(full)
+        if self.depth_tgc:
+            full_scale = _depth_scale(full, full_scale, self.tgc_smooth,
+                                      self.tgc_floor)
         full_polar = _polar(full, full_scale)                    # [B,S,2,H,W]
         full_feats = []
         for si in range(s_count):
@@ -185,13 +220,18 @@ class AcquisitionConditionEncoder(nn.Module):
         # correlation against the available event nearest to broadside.
         events = speed_events[:, self.ref_speed_index]
         event_scale = _group_scale(events, event_mask.float())
+        if self.depth_tgc:
+            event_scale = _depth_scale(events, event_scale, self.tgc_smooth,
+                                       self.tgc_floor)
         event_polar = _polar(events, event_scale)                # [B,A,2,H,W]
         ref_score = event_geom[:, :, 2].abs() + (~event_mask).float()*1e6
         ref_index = ref_score.argmin(dim=1)
         gather_index = ref_index.view(b, 1, 1, 1).expand(b, 1, h, w)
         reference = events.gather(1, gather_index).squeeze(1)
         q = events*reference[:, None].conj()
-        q = q/(events.abs()*reference[:, None].abs() + 1e-12)
+        q_floor = (self.q_rel_eps*event_scale**2 if self.q_rel_eps > 0.
+                   else torch.full_like(event_scale, 1e-12))
+        q = q/(events.abs()*reference[:, None].abs() + q_floor)
         q = torch.nan_to_num(q, nan=0., posinf=0., neginf=0.)
         geom_maps = event_geom[:, :, :, None, None].expand(b, n_event, -1, h, w)
         event_inputs = torch.cat([
@@ -226,6 +266,9 @@ class AcquisitionConditionEncoder(nn.Module):
         sub_gain = .1*torch.tanh(self.subap_gain(global_geom))[:, :, None, None]
         subap = subap*(1+sub_gain)*subap_mask[:, :, None, None]
         sub_scale = _group_scale(subap, subap_mask.float())
+        if self.depth_tgc:
+            sub_scale = _depth_scale(subap, sub_scale, self.tgc_smooth,
+                                     self.tgc_floor)
         sub_polar = _polar(subap, sub_scale)                    # [B,K,2,H,W]
         sub_geom_maps = subap_geom[:, :, :, None, None].expand(b, self.n_subap, -1, h, w)
         sub_inputs = torch.cat([sub_polar, sub_geom_maps], dim=2)

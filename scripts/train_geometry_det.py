@@ -39,6 +39,12 @@ def parse_args():
     p.add_argument('--canonical-angle', type=float, default=8.)
     p.add_argument('--event-bandwidth', type=float, default=2.)
     p.add_argument('--hidden-channels', type=int, default=16)
+    p.add_argument('--depth-tgc', action='store_true',
+                   help='per-depth-row (TGC-style) scale in the encoder polar '
+                        'encoding; restores deep-layer dynamic range')
+    p.add_argument('--q-rel-eps', type=float, default=0.,
+                   help='relative floor for the phase-correlation q '
+                        '(fraction of group-RMS^2); 0 keeps the legacy 1e-12')
     p.add_argument('--event-dropout', type=float, default=0.)
     p.add_argument('--min-events', type=int, default=6)
     p.add_argument('--lateral-mirror', action='store_true')
@@ -111,7 +117,10 @@ def main():
                        hidden_channels=args.hidden_channels,
                        event_geom_dim=cond.get('event_geom_dim', 4),
                        global_geom_dim=cond.get('global_geom_dim', 10),
-                       subap_geom_dim=cond.get('subap_geom_dim', 4))
+                       subap_geom_dim=cond.get('subap_geom_dim', 4),
+                       depth_tgc=args.depth_tgc,
+                       tgc_smooth=15, tgc_floor=.08,
+                       q_rel_eps=args.q_rel_eps)
     model = GeometryDeterministicSoS(
         unet=dict(cfg['unet']), encoder=encoder_cfg,
         u_clamp=args.u_clamp, loss=args.loss).to(device)
