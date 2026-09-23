@@ -51,14 +51,17 @@ def _depth_scale(z, group_scale, smooth=15, floor=0.08):
     Dividing by a smoothed per-row RMS restores their dynamic range; the
     floor keeps empty/echo-free rows from being boosted to full scale.
     """
-    # depth is the LAST axis in every condition group ([.., nx, nz])
-    reduce = tuple(d for d in range(z.ndim-1))
+    # depth is the LAST axis in every condition group ([.., nx, nz]);
+    # reduce everything except the batch dim and the depth axis.
+    reduce = tuple(d for d in range(z.ndim-1) if d != 0)
     row_rms = z.abs().square().mean(dim=reduce, keepdim=True).sqrt()
-    row_rms = row_rms.reshape(z.shape[0], 1, 1, z.shape[-1])   # [B,1,1,nz]
+    row_rms = row_rms.reshape(z.shape[0], *([1]*(z.ndim-2)), z.shape[-1])
+    # -> [B,1,..,1,nz]: size-1 on every axis except batch and depth
     k = int(smooth) | 1
-    row_rms = torch.nn.functional.avg_pool1d(
-        row_rms.squeeze(1).squeeze(1)[None], kernel_size=k, stride=1,
-        padding=k//2)[0].unsqueeze(1).unsqueeze(1)
+    b, w = z.shape[0], z.shape[-1]
+    pooled = torch.nn.functional.avg_pool1d(
+        row_rms.reshape(b, 1, w), kernel_size=k, stride=1, padding=k//2)
+    row_rms = pooled.reshape(b, *([1]*(z.ndim-2)), w)
     return torch.maximum(row_rms, floor*group_scale).clamp_min(1e-30)
 
 
