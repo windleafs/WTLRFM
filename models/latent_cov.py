@@ -68,26 +68,50 @@ class LatentCovarianceNoise(nn.Module):
         return img/self.scatter_norm
 
     def _local_sqrt(self, z):
-        """z [n, d] -> Gamma^{1/2} [n, d, d] via k-NN covariance, rank-truncated."""
+        """z [n, d] -> Gamma^{1/2} [n, d, d] via k-NN covariance, rank-truncated.
+
+        The eigendecomposition runs in float64 on a jittered covariance:
+        exact-duplicate neighbours make the float32 covariance singular and
+        eigh can fail outright (verified on the pre-dedup bank).  rank <= 0
+        keeps NO directions (pure eps*I), never all of them.
+        """
         n = z.shape[0]
         sq = []
+        eye = torch.eye(self.dim, dtype=torch.float64, device=z.device)
         for start in range(0, n, self.chunk):
             zc = z[start:start+self.chunk]                     # [m, d]
             d2 = (torch.cdist(zc, self.bank_z)**2)              # [m, N]
             nb = d2.topk(self.k, largest=False).indices         # [m, k]
-            zn = self.bank_z[nb]                                # [m, k, d]
+            zn = self.bank_z[nb].double()                       # [m, k, d]
             zn = zn - zn.mean(dim=1, keepdim=True)
             cov = torch.einsum('mki,mkj->mij', zn, zn)/self.k    # [m, d, d]
+            cov = cov + (self.eps*torch.diagonal(cov, dim1=1, dim2=2)
+                         .mean(dim=1, keepdim=True).clamp_min(1e-12))[:, None]*eye
             evals, evecs = torch.linalg.eigh(cov)
             evals = evals.clamp_min(0.)
             keep = torch.zeros_like(evals)
-            keep[:, -self.rank:] = 1.
+            if self.rank > 0:
+                keep[:, -self.rank:] = 1.
             lam = (evals.sqrt())*keep + self.eps
-            sq.append((evecs*lam.unsqueeze(1)) @ evecs.transpose(1, 2))
+            sq.append(((evecs*lam.unsqueeze(1)) @ evecs.transpose(1, 2))
+                      .to(z.dtype))
         return torch.cat(sq)
 
     def forward(self, u_gt, t, sigma_u, generator=None):
-        """Return (u_t, v_star) for per-sample times t [B]."""
+        """Return (u_t, v_star) for per-sample times t [B].
+
+        Additive split of the planned covariance path:
+
+            n_t = (1-t) sigma_u eta + t alpha sigma_u s(Gamma^{1/2} eps)
+
+        with eta a FULL-RANK per-pixel white field, so the t=0 marginal is
+        exactly N(0, sigma_u^2 I) and matches the inference-time white
+        start (the previous patch-decoded start had per-pixel std 0.26x
+        and neighbour correlation 0.58, a train/inference mismatch).  The
+        t=1 endpoint keeps alpha sigma_u s(Gamma^{1/2} eps) by design: the
+        target is distributional on the local SoS manifold neighbourhood.
+        v_star is the exact time derivative at fixed (eta, eps).
+        """
         b = u_gt.shape[0]
         patches = self._patches(u_gt)                          # [B, n, pp]
         z = (patches - self.center) @ self.basis               # [B, n, d]
@@ -97,20 +121,15 @@ class LatentCovarianceNoise(nn.Module):
                                                                       self.dim)
         eps = torch.randn(b, n, self.dim, device=u_gt.device,
                           dtype=u_gt.dtype, generator=generator)
-        eye = torch.eye(self.dim, device=u_gt.device, dtype=u_gt.dtype)
-        a_t = ((1.-t).view(b, 1, 1, 1)*eye
-               + (t*self.alpha).view(b, 1, 1, 1)*sqrt_g)        # [(1-t)I + taG^1/2]
-        a_v = (self.alpha*sqrt_g - eye)                        # d/dt bracket
-        noise_lat = torch.einsum('bnij,bnj->bni', a_t, eps)    # [B, n, d]
-        vcorr_lat = torch.einsum('bnij,bnj->bni', a_v, eps)
-        basis = self.basis                                     # [pp, d]
-        noise_px = torch.einsum('bnd,pd->bnp', noise_lat, basis) \
-            + (patches*0.)                                     # [B, n, pp] + center 0
-        vcorr_px = torch.einsum('bnd,pd->bnp', vcorr_lat, basis)
-        sigma = sigma_u.reshape(1, 1, 1)   # scalar broadcast
-        n_t = self._scatter(noise_px*sigma)
-        v_corr = self._scatter(vcorr_px*sigma)
+        eta = torch.randn(u_gt.shape, device=u_gt.device, dtype=u_gt.dtype,
+                          generator=generator)
+        struct_lat = torch.einsum('bnij,bnj->bni', sqrt_g, eps)
+        struct_px = self._scatter(torch.einsum('bnd,pd->bnp', struct_lat,
+                                               self.basis))
+        sigma = sigma_u.reshape(1, 1, 1, 1).to(device=u_gt.device,
+                                              dtype=u_gt.dtype)
         t_e = t.view(b, 1, 1, 1)
+        n_t = (1.-t_e)*sigma*eta + (t_e*self.alpha)*sigma*struct_px
         u_t = t_e*u_gt + n_t
-        v_star = u_gt + v_corr
+        v_star = u_gt + self.alpha*sigma*struct_px - sigma*eta
         return u_t, v_star

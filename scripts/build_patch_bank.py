@@ -19,9 +19,17 @@ sys.path.insert(0, str(ROOT))
 from data.geometry_dataset import StructuredSoSDataset  # noqa: E402
 
 
-def collect_patches(caches, split, patch, stride, max_bank, seed):
-    patches = []
+def collect_patches(caches, split, patch, stride, max_bank, per_record, seed):
+    """Exact-duplicate-free, per-record-capped patch library.
+
+    Grid sampling plus probability subsampling produced massive duplicates
+    (60000 rows, only 35976 unique; one group of 11135 identical patches),
+    which collapses k-NN covariances.  Here every record contributes at most
+    ``per_record`` unique patches and exact duplicates are dropped globally
+    before the final subsample.
+    """
     rng = np.random.default_rng(seed)
+    per_record_patches = []
     for cache in caches:
         ds = StructuredSoSDataset(cache, split)
         for rec in ds.records:
@@ -30,12 +38,17 @@ def collect_patches(caches, split, patch, stride, max_bank, seed):
             H, W = u.shape
             rows = range(0, H-patch+1, stride)
             cols = range(0, W-patch+1, stride)
-            take = rng.random((len(rows), len(cols))) < .12
-            for i, r in enumerate(rows):
-                for j, c in enumerate(cols):
-                    if take[i, j]:
-                        patches.append(u[r:r+patch, c:c+patch].reshape(-1))
-    patches = np.stack(patches)
+            take = rng.random((len(rows), len(cols))) < .5
+            sel = [u[r:r+patch, c:c+patch].reshape(-1)
+                   for i, r in enumerate(rows) for j, c in enumerate(cols)
+                   if take[i, j]]
+            sel = np.unique(np.stack(sel), axis=0) if sel else np.zeros((0, patch*patch), np.float32)
+            if len(sel) > per_record:
+                idx = rng.choice(len(sel), per_record, replace=False)
+                sel = sel[idx]
+            per_record_patches.append(sel)
+    patches = np.concatenate(per_record_patches)
+    patches = np.unique(patches, axis=0)                  # global exact dedup
     if len(patches) > max_bank:
         idx = rng.choice(len(patches), max_bank, replace=False)
         patches = patches[idx]
@@ -52,14 +65,15 @@ def main():
     p.add_argument('--stride', type=int, default=4)
     p.add_argument('--dim', type=int, default=16)
     p.add_argument('--max-bank', type=int, default=60000)
+    p.add_argument('--per-record', type=int, default=256)
     p.add_argument('--seed', type=int, default=20260923)
     args = p.parse_args()
     if args.out.exists():
         raise FileExistsError('fresh output path required')
     caches = [Path(v) for v in args.caches.split(',')]
     patches = collect_patches(caches, 'train', args.patch, args.stride,
-                              args.max_bank, args.seed)
-    print(f'bank patches: {patches.shape}', flush=True)
+                              args.max_bank, args.per_record, args.seed)
+    print(f'bank patches (deduped): {patches.shape}', flush=True)
     center = patches.mean(axis=0, keepdims=True)
     x = torch.from_numpy(patches - center)
     # PCA via SVD on the (subsampled) covariance
