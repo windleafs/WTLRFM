@@ -36,6 +36,8 @@ def main():
     for extra in [Path(v) for v in args.also.split(',') if v]:
         em = json.loads((extra/'manifest.json').read_text())
         for r in em['records']:
+            if r.get('split', 'train') != 'train':
+                continue          # keep held-out probe records out of training
             target = args.out/r['cache_file']
             if not target.exists():
                 target.symlink_to(extra/r['cache_file'])

@@ -58,11 +58,18 @@ def l125_case():
     return case
 
 
-def flat_maps(shape, x, z, c, mult, seed):
+def flat_maps(shape, x, z, c, mult, seed, n_disk=0):
     zz, xx = np.meshgrid(z, x, indexing='ij')
     rng = np.random.default_rng(seed)
     speckle = rng.normal(0., 8.*mult, shape)*(zz*1e3 >= 0.)
-    return {'sound_speed': np.full(shape, float(c), np.float32),
+    c_map = np.full(shape, float(c), np.float32)
+    for _ in range(int(n_disk)):
+        cx = rng.uniform(-15., 15.); cz = rng.uniform(8., 38.)
+        r = rng.uniform(2., 5.)
+        dc = rng.uniform(20., 80.)*rng.choice((-1., 1.))
+        inside = (xx-cx)**2 + (zz-cz)**2 <= (r*1e-3)**2
+        c_map[inside] = float(c) + float(dc)
+    return {'sound_speed': c_map,
             'density': (1000.+speckle).astype(np.float32),
             'alpha_coeff': np.full(shape, .002, np.float32),
             'BonA': np.zeros(shape, np.float32)}
@@ -91,8 +98,12 @@ def main():
                    default=Path('/data/zhuangyang/NumerialBreastPhantoms/'
                                 'l11_ultrawave_500_11angle'))
     p.add_argument('--out', required=True, type=Path)
-    p.add_argument('--n-breast', type=int, default=40)
-    p.add_argument('--n-flat', type=int, default=80)
+    p.add_argument('--n-breast', type=int, default=100)
+    p.add_argument('--n-flat', type=int, default=20)
+    p.add_argument('--n-incl', type=int, default=20)
+    p.add_argument('--val-breast', type=int, default=20)
+    p.add_argument('--val-flat', type=int, default=4)
+    p.add_argument('--val-incl', type=int, default=4)
     p.add_argument('--shard', default='0/1')
     args = p.parse_args()
     if 'torch' in sys.modules:
@@ -120,25 +131,40 @@ def main():
 
     index = json.loads((args.root/'index.json').read_text())
     trains = [r for r in index['samples'] if r['split'] == 'train']
-    breast_planes = trains[::4][:args.n_breast]        # same 120-plane pool
+    pool = trains[::4]
+    breast_planes = pool[:args.n_breast]
+    val_planes = pool[args.n_breast:args.n_breast+args.val_breast]
     jobs = []
     for rec in breast_planes:
-        jobs.append((f"{rec['id']}_l125breast", 'breast', rec))
+        jobs.append((f"{rec['id']}_l125breast", 'breast', rec, 'train'))
+    for rec in val_planes:
+        jobs.append((f"{rec['id']}_l125breastVAL", 'breastVAL', rec, 'val'))
     rng_master = np.random.default_rng(20260924)
+    def flat_job(k, family, split, seed_offset):
+        r = np.random.default_rng(20260924 + seed_offset + k)
+        return (f'flat{k:03d}_l125{family}', family,
+                dict(c=float(r.uniform(1450., 1580.)),
+                     mult=float(r.uniform(.3, 2.2)),
+                     seed=int(r.integers(1 << 30)),
+                     n_disk=(0 if family in ('flat', 'flatVAL') else
+                             int(r.integers(2, 5)))), split)
     for k in range(args.n_flat):
-        jobs.append((f'flat{k:03d}_l125flat', 'flat',
-                     dict(c=float(rng_master.uniform(1450., 1580.)),
-                          mult=float(rng_master.uniform(.3, 2.2)),
-                          seed=int(rng_master.integers(1 << 30)))))
+        jobs.append(flat_job(k, 'flat', 'train', 0))
+    for k in range(args.n_incl):
+        jobs.append(flat_job(k, 'incl', 'train', 555))
+    for k in range(args.val_flat):
+        jobs.append(flat_job(k, 'flatVAL', 'val', 909))
+    for k in range(args.val_incl):
+        jobs.append(flat_job(k, 'inclVAL', 'val', 1111))
     i, n = (int(v) for v in args.shard.split('/'))
     work = jobs[i::n]
     start = time.monotonic()
-    for k, (job_id, family, spec) in enumerate(work, 1):
+    for k, (job_id, family, spec, split) in enumerate(work, 1):
         out_path = args.out/f'{job_id}.npz'
         if out_path.exists():
             continue
         case = l125_case()
-        if family == 'breast':
+        if family in ('breast', 'breastVAL'):
             with h5py.File(spec['h5'], 'r') as f:
                 plane = np.asarray(f['phan'][spec['z_index']])
             maps, *_ = gen.medium_builder.build_medium(
@@ -147,12 +173,12 @@ def main():
         else:
             maps = flat_maps((len(case['z']), len(case['x'])),
                              case['x'], case['z'], spec['c'], spec['mult'],
-                             spec['seed'])
+                             spec['seed'], n_disk=spec.get('n_disk', 0))
         rf, trefs = simulate_maps(case, maps, None, None, refs, angles)
         if not np.isfinite(rf).all() or rf.std() <= 0:
             raise RuntimeError(f'{job_id}: invalid RF')
         c, m, _ = gen.truth_maps(maps, case['x'], case['face'])
-        meta = {'id': job_id, 'family': family, 'split': 'train',
+        meta = {'id': job_id, 'family': family.rstrip('VAL'), 'split': split,
                 'angles_deg': angles.tolist(), 'source_tref_s': trefs,
                 'fs_hz': L125_FS, 'fc_hz': L125_FC,
                 'band_hz': list(L125_BAND), 'n_elements': L125_NE,
