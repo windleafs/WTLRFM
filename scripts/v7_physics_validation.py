@@ -73,8 +73,10 @@ def main():
         rng = np.random.default_rng(7)
         from scipy.ndimage import gaussian_filter
         smooth = gaussian_filter(d['truth'], sigma=15, mode='nearest')
-        perturb = d['truth'] + 20.*gaussian_filter(rng.standard_normal(
-            d['truth'].shape), sigma=10, mode='nearest')/1.0
+        perturbed = gaussian_filter(rng.standard_normal(d['truth'].shape),
+                                    sigma=10, mode='nearest')
+        perturbed *= 20./max(perturbed.std(), 1e-12)   # fixed 20 m/s RMS
+        perturb = d['truth'] + perturbed
         cands = {'gt': d['truth'], 'smooth_gt': smooth, 'perturb_gt': perturb,
                  'pred_v5': d['pred'],
                  'const_1500': np.full_like(d['truth'], 1500.),
@@ -82,13 +84,18 @@ def main():
         for off in (10., 20., 40.):
             cands[f'gt{off:+.0f}'] = d['truth'] + off
             cands[f'gt{-off:+.0f}'] = d['truth'] - off
+        roi_np = np.asarray(roi, bool)
         table = {}
         for name, c in cands.items():
             cs = project(c)
             coh, energy = coherence_metrics(model, fields, roi, cs)
+            dd = np.asarray(cs)-np.asarray(gt_speed)
+            # metrics inside the ROI only: the WFC grid pads ~54% of its
+            # area beyond the record support with clipped boundary copies,
+            # which would dilute mae/bias roughly twofold
             table[name] = {'coherence': coh, 'energy': energy,
-                           'mae_vs_gt': float(np.abs(np.asarray(cs)-np.asarray(gt_speed)).mean()),
-                           'bias': float((np.asarray(cs)-np.asarray(gt_speed)).mean())}
+                           'mae_vs_gt': float(np.abs(dd[roi_np]).mean()),
+                           'bias': float(dd[roi_np].mean())}
 
         # --- full-map gradient probe
         probes = {}
@@ -118,8 +125,8 @@ def main():
             state = opt.init(cv)
             hist = [{'step': 0,
                      'coherence': coherence_metrics(model, fields, roi, cv)[0],
-                     'mae': float(np.abs(np.asarray(cv)-np.asarray(gt_speed)).mean()),
-                     'bias': float((np.asarray(cv)-np.asarray(gt_speed)).mean())}]
+                     'mae': float(np.abs((np.asarray(cv)-np.asarray(gt_speed))[roi_np]).mean()),
+                     'bias': float((np.asarray(cv)-np.asarray(gt_speed))[roi_np].mean())}]
             for step in range(1, args.steps+1):
                 v, g = loss_and_grad(cv)
                 if not np.isfinite(float(v)) or not np.isfinite(np.asarray(g)).all():
@@ -129,8 +136,8 @@ def main():
                 cv = optax.apply_updates(cv, upd)
                 hist.append({'step': step,
                              'coherence': coherence_metrics(model, fields, roi, cv)[0],
-                             'mae': float(np.abs(np.asarray(cv)-np.asarray(gt_speed)).mean()),
-                             'bias': float((np.asarray(cv)-np.asarray(gt_speed)).mean())})
+                             'mae': float(np.abs((np.asarray(cv)-np.asarray(gt_speed))[roi_np]).mean()),
+                             'bias': float((np.asarray(cv)-np.asarray(gt_speed))[roi_np].mean())})
             probes[start_name] = hist
         report[rec['id']] = {'group': rec['group'], 'table': table,
                              'probes': probes}
