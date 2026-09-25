@@ -97,7 +97,8 @@ class AcquisitionConditionEncoder(nn.Module):
                  event_bandwidth_deg=2., hidden_channels=16,
                  event_geom_dim=4, global_geom_dim=10, subap_geom_dim=4,
                  depth_tgc=False, tgc_smooth=15, tgc_floor=.08,
-                 q_rel_eps=0., slot_mode='learned', explicit_q=''):
+                 q_rel_eps=0., slot_mode='learned', explicit_q='',
+                 subap_q=False):
         super().__init__()
         self.speeds = tuple(float(c) for c in speeds)
         self.ref_speed_index = int(ref_speed_index)
@@ -123,6 +124,11 @@ class AcquisitionConditionEncoder(nn.Module):
         # reference, 'adj': adjacent transmit angle, 'sym': mirrored angle),
         # each contributing Re and Im directly to the pooled event output.
         self.q_pairs = tuple(explicit_q.split(',')) if explicit_q else ()
+        # angle x sub-aperture phase slope: adjacent-subaperture normalised
+        # complex correlation computed PER transmit angle, pooled into the
+        # event slots late (the compounded subap branch sums over angles
+        # first and would discard exactly this structure).
+        self.subap_q = bool(subap_q)
         unknown_pairs = set(self.q_pairs) - {'ref', 'adj', 'sym'}
         if unknown_pairs:
             raise ValueError(f'unknown q pairs {sorted(unknown_pairs)}')
@@ -136,7 +142,9 @@ class AcquisitionConditionEncoder(nn.Module):
         if self.n_event_slots < 2 or self.n_subap < 1 or self.canonical_angle_deg <= 0:
             raise ValueError('Invalid canonical acquisition layout')
         self.out_channels = (2*len(self.speeds)
-                             + (2 + 2*len(self.q_pairs))*self.n_event_slots
+                             + (2 + 2*len(self.q_pairs)
+                                + (2*(self.n_subap-1) if self.subap_q else 0))
+                             * self.n_event_slots
                              + 2*self.n_subap)
         self.cfg = dict(speeds=self.speeds, ref_speed_index=self.ref_speed_index,
                         n_event_slots=self.n_event_slots, n_subap=self.n_subap,
@@ -310,12 +318,14 @@ class AcquisitionConditionEncoder(nn.Module):
             slots = torch.cat([slots, pooled_q], dim=2)
         event_out = slots.flatten(1, 2)
 
+        pooled_qsub = None
         if subap_events is not None:
             # Recompose receive sub-apertures from the same active transmit
             # event set used by the full/event branches. This prevents masked
             # transmit events leaking through a pre-compounded subap tensor.
-            subap = (subap_events * event_mask[:, :, None, None, None]
-                     .to(subap_events.dtype)).sum(dim=1)
+            sa = subap_events*event_mask[:, :, None, None, None].to(
+                subap_events.dtype)
+            subap = sa.sum(dim=1)
         sub_gain = .1*torch.tanh(self.subap_gain(global_geom))[:, :, None, None]
         subap = subap*(1+sub_gain)*subap_mask[:, :, None, None]
         sub_scale = _group_scale(subap, subap_mask.float())
@@ -328,6 +338,20 @@ class AcquisitionConditionEncoder(nn.Module):
         sub_res = self.subap_residual(sub_inputs.reshape(b*self.n_subap, -1, h, w))
         sub_feats = (sub_polar + sub_res.reshape(b, self.n_subap, 2, h, w))
         sub_out = (sub_feats*subap_mask[:, :, None, None, None]).flatten(1, 2)
+
+        if self.subap_q:
+            sub_floor = (self.q_rel_eps*sub_scale**2 if self.q_rel_eps > 0.
+                         else torch.full_like(sub_scale, 1e-12))
+            sub_floor = sub_floor.reshape(b, 1, 1, 1, -1)   # vs [B,A,K,H,W]
+            qs = (sa[:, :, :-1]*sa[:, :, 1:].conj()
+                  /(sa[:, :, :-1].abs()*sa[:, :, 1:].abs() + sub_floor))
+            qs = torch.stack([qs.real, qs.imag], dim=3).reshape(
+                b, n_event, -1, h, w)
+            qs = torch.nan_to_num(qs, nan=0., posinf=0., neginf=0.)
+            qs = qs*event_mask[:, :, None, None, None].to(qs.dtype)
+            pooled_qsub = torch.einsum('bak,bachw->bkchw', weights, qs)
+            event_out = torch.cat([event_out,
+                                   pooled_qsub.flatten(1, 2)], dim=1)
 
         encoded = torch.cat([full_out, event_out, sub_out], dim=1)
         if encoded.shape[1] != self.out_channels or not torch.isfinite(encoded).all():

@@ -39,6 +39,9 @@ def parse_args():
     p.add_argument('--canonical-angle', type=float, default=8.)
     p.add_argument('--event-bandwidth', type=float, default=2.)
     p.add_argument('--hidden-channels', type=int, default=16)
+    p.add_argument('--subap-q', action='store_true',
+                   help='per-angle adjacent-subaperture phase-slope channels '
+                        'pooled late into the event slots')
     p.add_argument('--explicit-q', default='',
                    help='comma list of relative-phase pairs kept as explicit '
                         'Re/Im channels outside the event residual: '
@@ -214,7 +217,8 @@ def main():
                        tgc_smooth=15, tgc_floor=.08,
                        q_rel_eps=args.q_rel_eps,
                        slot_mode=args.slot_mode,
-                       explicit_q=args.explicit_q)
+                       explicit_q=args.explicit_q,
+                       subap_q=args.subap_q)
 
     pretrained_blob = None
     unet = dict(cfg['unet'])
