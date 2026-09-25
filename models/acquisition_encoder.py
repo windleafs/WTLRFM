@@ -97,7 +97,7 @@ class AcquisitionConditionEncoder(nn.Module):
                  event_bandwidth_deg=2., hidden_channels=16,
                  event_geom_dim=4, global_geom_dim=10, subap_geom_dim=4,
                  depth_tgc=False, tgc_smooth=15, tgc_floor=.08,
-                 q_rel_eps=0.):
+                 q_rel_eps=0., slot_mode='learned', explicit_q=''):
         super().__init__()
         self.speeds = tuple(float(c) for c in speeds)
         self.ref_speed_index = int(ref_speed_index)
@@ -113,6 +113,21 @@ class AcquisitionConditionEncoder(nn.Module):
         # once |e|*|r| falls below it).  depth_tgc rescales rows TGC-style;
         # q_rel_eps > 0 makes that floor relative to the group RMS.
         self.depth_tgc = bool(depth_tgc)
+        # 'learned': soft Gaussian pooling onto learnable canonical slots.
+        # 'fixed':   one-to-one positional passthrough, event j -> slot j
+        #            (diagnostic for slot collapse; training data has the 11
+        #            canonical angles in ascending order).
+        self.slot_mode = str(slot_mode)
+        # Explicit relative-phase channels kept OUTSIDE the event residual:
+        # one complex channel per selected pair ('ref': vs near-broadside
+        # reference, 'adj': adjacent transmit angle, 'sym': mirrored angle),
+        # each contributing Re and Im directly to the pooled event output.
+        self.q_pairs = tuple(explicit_q.split(',')) if explicit_q else ()
+        unknown_pairs = set(self.q_pairs) - {'ref', 'adj', 'sym'}
+        if unknown_pairs:
+            raise ValueError(f'unknown q pairs {sorted(unknown_pairs)}')
+        if self.slot_mode not in ('learned', 'fixed'):
+            raise ValueError(f'unknown slot_mode {slot_mode!r}')
         self.tgc_smooth = int(tgc_smooth)
         self.tgc_floor = float(tgc_floor)
         self.q_rel_eps = float(q_rel_eps)
@@ -120,7 +135,9 @@ class AcquisitionConditionEncoder(nn.Module):
             raise ValueError('Invalid speed group/ref_speed_index')
         if self.n_event_slots < 2 or self.n_subap < 1 or self.canonical_angle_deg <= 0:
             raise ValueError('Invalid canonical acquisition layout')
-        self.out_channels = 2*len(self.speeds) + 2*self.n_event_slots + 2*self.n_subap
+        self.out_channels = (2*len(self.speeds)
+                             + (2 + 2*len(self.q_pairs))*self.n_event_slots
+                             + 2*self.n_subap)
         self.cfg = dict(speeds=self.speeds, ref_speed_index=self.ref_speed_index,
                         n_event_slots=self.n_event_slots, n_subap=self.n_subap,
                         canonical_angle_deg=self.canonical_angle_deg,
@@ -130,7 +147,8 @@ class AcquisitionConditionEncoder(nn.Module):
                         global_geom_dim=self.global_geom_dim,
                         subap_geom_dim=self.subap_geom_dim,
                         depth_tgc=self.depth_tgc, tgc_smooth=self.tgc_smooth,
-                        tgc_floor=self.tgc_floor, q_rel_eps=self.q_rel_eps)
+                        tgc_floor=self.tgc_floor, q_rel_eps=self.q_rel_eps,
+                        slot_mode=self.slot_mode)
 
         canonical = np.deg2rad(np.linspace(-self.canonical_angle_deg,
                                            self.canonical_angle_deg,
@@ -236,6 +254,28 @@ class AcquisitionConditionEncoder(nn.Module):
                    else torch.full_like(event_scale, 1e-12))
         q = q/(events.abs()*reference[:, None].abs() + q_floor)
         q = torch.nan_to_num(q, nan=0., posinf=0., neginf=0.)
+        # Explicit relative-phase features: kept as independent Re/Im
+        # channels that bypass the event residual compression entirely.
+        explicit = []
+        if 'ref' in self.q_pairs:
+            explicit += [q.real, q.imag]                      # q_{i,0}
+        if 'adj' in self.q_pairs:
+            q_adj = torch.zeros_like(events)
+            q_adj[:, :-1] = (events[:, :-1]*events[:, 1:].conj()
+                             /(events[:, :-1].abs()*events[:, 1:].abs()
+                               + q_floor))
+            explicit += [q_adj.real, q_adj.imag]              # q_{i,i+1}
+        if 'sym' in self.q_pairs:
+            idx = torch.arange(n_event-1, -1, -1, device=device)
+            mirrored = events[:, idx]
+            q_sym = (events*mirrored.conj()
+                     /(events.abs()*mirrored.abs() + q_floor))
+            explicit += [q_sym.real, q_sym.imag]              # q_{i,A-1-i}
+        if explicit:
+            explicit = torch.stack(explicit, dim=2)           # [B,A,2P,H,W]
+            explicit = torch.nan_to_num(explicit, nan=0., posinf=0., neginf=0.)
+            explicit = explicit*event_mask[:, :, None, None, None].to(explicit.dtype)
+
         geom_maps = event_geom[:, :, :, None, None].expand(b, n_event, -1, h, w)
         event_inputs = torch.cat([
             event_polar,
@@ -249,15 +289,25 @@ class AcquisitionConditionEncoder(nn.Module):
         features = features*(1+gamma[:, None, :, None, None]) + beta[:, None, :, None, None]
         features = features*event_mask[:, :, None, None, None].to(features.dtype)
 
-        theta = torch.atan2(event_geom[:, :, 0], event_geom[:, :, 1])
-        canonical = self.slot_angles.clamp(-np.deg2rad(self.canonical_angle_deg),
-                                         np.deg2rad(self.canonical_angle_deg))
-        bandwidth = F.softplus(self.log_bandwidth) + np.deg2rad(.1)
-        score = -.5*((theta[:, :, None]-canonical[None, None, :])/bandwidth)**2
-        score = score.masked_fill(~event_mask[:, :, None], -1e4)
-        null = self.null_score.view(1, 1, 1).expand(b, 1, self.n_event_slots)
-        weights = torch.softmax(torch.cat([score, null], dim=1), dim=1)[:, :n_event]
+        if self.slot_mode == 'fixed':
+            weights = torch.zeros(b, n_event, self.n_event_slots,
+                                  device=device, dtype=features.dtype)
+            idx = torch.arange(min(n_event, self.n_event_slots), device=device)
+            weights[:, idx, idx] = 1.
+            weights = weights*event_mask[:, :, None].to(features.dtype)
+        else:
+            theta = torch.atan2(event_geom[:, :, 0], event_geom[:, :, 1])
+            canonical = self.slot_angles.clamp(-np.deg2rad(self.canonical_angle_deg),
+                                             np.deg2rad(self.canonical_angle_deg))
+            bandwidth = F.softplus(self.log_bandwidth) + np.deg2rad(.1)
+            score = -.5*((theta[:, :, None]-canonical[None, None, :])/bandwidth)**2
+            score = score.masked_fill(~event_mask[:, :, None], -1e4)
+            null = self.null_score.view(1, 1, 1).expand(b, 1, self.n_event_slots)
+            weights = torch.softmax(torch.cat([score, null], dim=1), dim=1)[:, :n_event]
         slots = torch.einsum('bak,bachw->bkchw', weights, features)
+        if self.q_pairs:
+            pooled_q = torch.einsum('bak,bachw->bkchw', weights, explicit)
+            slots = torch.cat([slots, pooled_q], dim=2)
         event_out = slots.flatten(1, 2)
 
         if subap_events is not None:

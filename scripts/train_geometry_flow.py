@@ -39,6 +39,13 @@ def parse_args():
     p.add_argument('--canonical-angle', type=float, default=8.)
     p.add_argument('--event-bandwidth', type=float, default=2.)
     p.add_argument('--hidden-channels', type=int, default=16)
+    p.add_argument('--explicit-q', default='',
+                   help='comma list of relative-phase pairs kept as explicit '
+                        'Re/Im channels outside the event residual: '
+                        'ref,adj,sym')
+    p.add_argument('--slot-mode', choices=('learned', 'fixed'), default='learned',
+                   help='event->slot mapping: learned soft pooling (default) or '
+                        'fixed one-to-one passthrough (slot-collapse diagnostic)')
     p.add_argument('--depth-tgc', action='store_true',
                    help='per-depth-row (TGC-style) scale in the encoder polar '
                         'encoding; restores deep-layer dynamic range')
@@ -205,7 +212,9 @@ def main():
                        subap_geom_dim=cond.get('subap_geom_dim', 4),
                        depth_tgc=args.depth_tgc,
                        tgc_smooth=15, tgc_floor=.08,
-                       q_rel_eps=args.q_rel_eps)
+                       q_rel_eps=args.q_rel_eps,
+                       slot_mode=args.slot_mode,
+                       explicit_q=args.explicit_q)
 
     pretrained_blob = None
     unet = dict(cfg['unet'])
